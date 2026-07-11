@@ -121,7 +121,7 @@ func Deploy(ctx context.Context, o Options) (string, error) {
 		run  func() error
 	}{
 		{"create install dir", func() error { return run(client, o, &log, "mkdir -p "+shellQuote(o.RemoteDir)) }},
-		{"upload binary", func() error { return upload(client, o, &log, bin, o.BinaryPath, "0755") }},
+		{"upload binary", func() error { return uploadBinary(client, o, &log, bin, o.BinaryPath) }},
 		{"upload config", func() error { return uploadFiles(client, o, &log, o.RemoteDir) }},
 		{"privileged ports", func() error { return grantPorts(client, o, &log, bin) }},
 		{"install service", func() error { return installService(client, o, &log, bin) }},
@@ -333,6 +333,18 @@ func upload(client *ssh.Client, o Options, log *bytes.Buffer, path string, data 
 	return nil
 }
 
+// uploadBinary ships the binary NEXT TO its destination and renames it into
+// place: on a redeploy the old relay is still executing the destination file,
+// and Linux refuses to write an executing binary (ETXTBSY) — while the atomic
+// mv swaps the directory entry and leaves the running process its old inode
+// until the restart hands over. Same pattern as install.sh's updater.
+func uploadBinary(client *ssh.Client, o Options, log *bytes.Buffer, bin string, data []byte) error {
+	if err := upload(client, o, log, bin+".new", data, "0755"); err != nil {
+		return err
+	}
+	return run(client, o, log, "mv -f "+shellQuote(bin+".new")+" "+shellQuote(bin))
+}
+
 func uploadFiles(client *ssh.Client, o Options, log *bytes.Buffer, dir string) error {
 	for name, data := range o.Files {
 		mode := "0644"
@@ -384,8 +396,11 @@ WantedBy=multi-user.target
 	return run(client, o, log, "systemctl daemon-reload")
 }
 
+// startService enables and RESTARTS the unit — not `enable --now`, which is a
+// no-op on an already-running service and would leave a redeploy serving the
+// old binary with the old certs until someone restarts it by hand.
 func startService(client *ssh.Client, o Options, log *bytes.Buffer) error {
-	return run(client, o, log, "systemctl enable --now mailrelay.service")
+	return run(client, o, log, "systemctl enable mailrelay.service && systemctl restart mailrelay.service")
 }
 
 // sudoWrap prepares a remote command and its stdin for the login's privilege

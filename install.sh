@@ -13,7 +13,10 @@
 # against the manifest on get.mailnite.com, installs it as a hardened systemd
 # service that may bind ports below 1024 (via AmbientCapabilities — NOT setcap,
 # which a binary update would silently strip), and starts it. Re-running the
-# command upgrades in place. A daily systemd timer keeps it up to date.
+# command upgrades in place and RESTARTS the service, so the fresh binary and
+# any new --token/--transport/--bind take effect immediately (settings not
+# repeated on the re-run are inherited from the existing install). A daily
+# systemd timer keeps it up to date.
 #
 # Options (after `bash -s --`):
 #   --token <KEY>      handshake key from the mailnite admin console (required
@@ -196,18 +199,28 @@ fi
 # The key (and any non-default transport/bind) lives in an environment file the
 # service user can read but nobody else — never on the command line, so it does
 # not show in `ps` or `systemctl cat`.
+#
+# A re-run may omit flags it passed the first time (the common case: rotating
+# only the token), so inherit anything not overridden from the existing env
+# file — a reinstall must never silently drop the transport/bind (or the key)
+# the relay was running with.
 mkdir -p "$ENV_DIR"
+if [ -s "$ENV_FILE" ]; then
+  [ -n "$TOKEN" ]     || TOKEN="$(sed -n 's/^MAILRELAY_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
+  [ -n "$TRANSPORT" ] || TRANSPORT="$(sed -n 's/^MAILRELAY_TRANSPORT=//p' "$ENV_FILE" | tail -n 1)"
+  [ -n "$BIND" ]      || BIND="$(sed -n 's/^MAILRELAY_BIND=//p' "$ENV_FILE" | tail -n 1)"
+fi
 if [ -n "$TOKEN" ]; then
   umask 077
   {
     echo "MAILRELAY_TOKEN=$TOKEN"
-    [ -n "$TRANSPORT" ] && echo "MAILRELAY_TRANSPORT=$TRANSPORT"
-    [ -n "$BIND" ] && echo "MAILRELAY_BIND=$BIND"
+    if [ -n "$TRANSPORT" ]; then echo "MAILRELAY_TRANSPORT=$TRANSPORT"; fi
+    if [ -n "$BIND" ]; then echo "MAILRELAY_BIND=$BIND"; fi
   } > "$ENV_FILE"
   chown root:"$SVC_USER" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
   umask 022
-elif [ ! -s "$ENV_FILE" ]; then
+else
   die "no --token given and no existing $ENV_FILE — generate the key in the mailnite admin console (Mail relay → step 1) and re-run with --token"
 fi
 
@@ -324,17 +337,31 @@ EOF
 fi
 
 systemctl daemon-reload
-systemctl enable --now mailrelay.service
+# enable + restart, NOT `enable --now`: --now is a no-op on a service that is
+# already running, so a re-run of this installer would leave the OLD process
+# serving with the OLD binary and env. restart hands over in every case (and
+# plain-starts a fresh install). Same for the timer, so a changed schedule or
+# updater script takes effect on re-runs.
+systemctl enable mailrelay.service
+systemctl restart mailrelay.service
 if [ "$AUTOUPDATE" = 1 ]; then
-  systemctl enable --now mailrelay-update.timer
+  systemctl enable mailrelay-update.timer
+  systemctl restart mailrelay-update.timer
+else
+  # An explicit --no-autoupdate on a re-run must also switch OFF a timer a
+  # previous install enabled.
+  systemctl disable --now mailrelay-update.timer 2>/dev/null || true
 fi
 
 # ----- report ------------------------------------------------------------------
 
 port="8443"
 if [ -n "$BIND" ]; then port="${BIND##*:}"; fi
-ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')"
-[ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# The address lookup is best-effort reporting: under `set -euo pipefail` a
+# missing iproute2 / no default route must not fail an install that already
+# succeeded, hence the `|| true` guards.
+ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+[ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 [ -n "$ip" ] || ip="<this-host>"
 
 echo

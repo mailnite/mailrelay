@@ -21,6 +21,11 @@ build:
 test:
 	go vet ./... && go test ./... -race
 
+# Behavioral test of install.sh (install/reinstall/autoupdate handover) against
+# stubbed systemctl/curl — no root, no network, no systemd needed.
+test-install:
+	bash test/install_test.sh
+
 # Compile every target without keeping artifacts — the fast per-commit gate.
 # `go build ./...` (a package list) type-checks and links but writes nothing.
 crosscheck:
@@ -50,4 +55,4 @@ release: clean
 clean:
 	rm -rf dist mailrelay
 
-.PHONY: build test crosscheck release clean
+.PHONY: build test test-install crosscheck release clean
