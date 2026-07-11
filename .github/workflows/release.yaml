@@ -4,10 +4,11 @@ name: Release
 # amd64/arm64, tar.gz + windows zip) with the version stamped in, and attaches
 # them plus SHA256SUMS to the GitHub release for that tag.
 #
-# Afterwards, publish the version to the update channel so installers and the
-# daily update timers pick it up:
-#   mailnite-get$ ./release.sh mailrelay vX.Y.Z <downloaded SHA256SUMS>
-#   (commit, tag, and let mailnite-get's deploy workflow ship it)
+# It then registers the version with the get.mailnite.com update channel so
+# installers and daily update timers pick it up — automatically when a
+# CHANNEL_DISPATCH_TOKEN secret is present (a PAT with actions:write on
+# mailnite/mailnite-get), else do it by hand from the mailnite-get repo:
+#   Actions → "Register a release" → mailrelay / vX.Y.Z
 on:
   push:
     tags: ['v*']
@@ -18,6 +19,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # Exposed at job scope so a step `if` can test its presence (the secrets
+      # context is not reliably readable in `if`). Empty when the secret is unset.
+      CHANNEL_DISPATCH_TOKEN: ${{ secrets.CHANNEL_DISPATCH_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -47,3 +52,16 @@ jobs:
             --title "mailrelay $GITHUB_REF_NAME" \
             --generate-notes \
           || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+      - name: Register the version with the update channel
+        # Optional zero-touch hop: fires only when the cross-repo PAT exists.
+        # Without it, register manually from the mailnite-get Actions tab.
+        if: ${{ env.CHANNEL_DISPATCH_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ env.CHANNEL_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/mailnite/mailnite-get/dispatches \
+            -f event_type=register-release \
+            -f 'client_payload[project]=mailrelay' \
+            -f "client_payload[version]=$GITHUB_REF_NAME"
+          echo "Notified mailnite-get to register mailrelay $GITHUB_REF_NAME"
