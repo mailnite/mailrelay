@@ -1,0 +1,49 @@
+name: Release
+
+# Tagging vX.Y.Z builds the six distributables (linux/darwin/windows ×
+# amd64/arm64, tar.gz + windows zip) with the version stamped in, and attaches
+# them plus SHA256SUMS to the GitHub release for that tag.
+#
+# Afterwards, publish the version to the update channel so installers and the
+# daily update timers pick it up:
+#   mailnite-get$ ./release.sh mailrelay vX.Y.Z <downloaded SHA256SUMS>
+#   (commit, tag, and let mailnite-get's deploy workflow ship it)
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Vet & test (race)
+        run: make test
+
+      - name: Build the distributables
+        run: make release
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - name: Create the GitHub release with dist/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Re-running the workflow for an existing release just refreshes the
+          # assets instead of failing.
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "mailrelay $GITHUB_REF_NAME" \
+            --generate-notes \
+          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber

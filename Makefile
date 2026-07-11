@@ -1,36 +1,53 @@
 # mailrelay build & release
 #
-# `make release` produces dist/: one tar.gz per target plus SHA256SUMS —
-# exactly the artifact set the installer (install.sh) and the get.mailnite.com
-# manifest (mailnite-get/release.sh) consume. Upload dist/* to the GitHub
-# release for VERSION, then stamp the channel with mailnite-get/release.sh.
+# `make release` produces dist/: one archive per target (tar.gz, zip on
+# windows) plus SHA256SUMS — exactly the artifact set the installer
+# (install.sh) and the get.mailnite.com manifest (mailnite-get/release.sh)
+# consume. CI attaches dist/* to the GitHub release on a tag; `make crosscheck`
+# is the artifact-less compile check CI runs on every commit to main.
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS  = -s -w -X main.Version=$(VERSION) -X main.Build=$(BUILD)
 
-# The relay targets Linux VDS machines; amd64 + arm64 cover them.
-TARGETS = linux_amd64 linux_arm64
+# Two architectures on the three operating systems that matter. The relay
+# itself targets a Linux VDS; the darwin/windows builds are for running the
+# workstation-side tooling (gen-ca, gen-certs, deploy) natively.
+TARGETS = linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 windows_arm64
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o mailrelay .
 
 test:
-	go build ./... && go test ./... -race
+	go vet ./... && go test ./... -race
+
+# Compile every target without keeping artifacts — the fast per-commit gate.
+# `go build ./...` (a package list) type-checks and links but writes nothing.
+crosscheck:
+	@for t in $(TARGETS); do \
+		os=$${t%_*}; arch=$${t#*_}; \
+		echo "compile $$t"; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build ./... || exit 1; \
+	done
 
 release: clean
 	@mkdir -p dist
 	@for t in $(TARGETS); do \
 		os=$${t%_*}; arch=$${t#*_}; \
+		bin=mailrelay; if [ "$$os" = "windows" ]; then bin=mailrelay.exe; fi; \
 		echo "building $$t"; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o dist/mailrelay . || exit 1; \
-		tar -czf dist/mailrelay_$$t.tar.gz -C dist mailrelay; \
-		rm dist/mailrelay; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o dist/$$bin . || exit 1; \
+		if [ "$$os" = "windows" ]; then \
+			(cd dist && zip -q mailrelay_$$t.zip $$bin) || exit 1; \
+		else \
+			tar -czf dist/mailrelay_$$t.tar.gz -C dist $$bin || exit 1; \
+		fi; \
+		rm dist/$$bin; \
 	done
-	@cd dist && sha256sum *.tar.gz > SHA256SUMS
+	@cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS
 	@echo "release $(VERSION):" && cat dist/SHA256SUMS
 
 clean:
 	rm -rf dist mailrelay
 
-.PHONY: build test release clean
+.PHONY: build test crosscheck release clean

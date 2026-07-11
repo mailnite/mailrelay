@@ -1,0 +1,31 @@
+name: Build
+
+# The artifact-less gate: every commit to main (and every PR) must vet, pass
+# the race-enabled tests, and cross-compile for all six release targets. No
+# distributables are produced here — those come from release.yaml on a tag.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Vet & test (race)
+        run: make test
+
+      - name: Cross-compile all targets (no artifacts)
+        run: make crosscheck
