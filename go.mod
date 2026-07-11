@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	go.arpabet.com/cligo v0.5.1
+	go.arpabet.com/glue v1.5.1
 	go.arpabet.com/servion v1.5.5
 	go.arpabet.com/value v1.3.1
 	go.arpabet.com/value-rpc v1.5.5
@@ -28,7 +29,6 @@ require (
 	github.com/quic-go/quic-go v0.60.0 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
-	go.arpabet.com/glue v1.5.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/net v0.56.0 // indirect

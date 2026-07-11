@@ -59,27 +59,9 @@ func (t *DeployCommand) Run(ctx context.Context) error {
 	if err != nil {
 		return xerrors.Errorf("read relay binary %q: %w", t.Binary, err)
 	}
-	files := map[string][]byte{}
-	if err := addFile(files, "ca.pem", t.CACert); err != nil {
+	files, serveArgs, err := t.deployPlan()
+	if err != nil {
 		return err
-	}
-	if err := addFile(files, "relay.crt", t.Cert); err != nil {
-		return err
-	}
-	if err := addFile(files, "relay.key", t.Key); err != nil {
-		return err
-	}
-
-	serveArgs := fmt.Sprintf("--transport %s --bind %s --ca %s/ca.pem --cert %s/relay.crt --key %s/relay.key",
-		t.Transport, t.Bind, t.RemoteDir, t.RemoteDir, t.RemoteDir)
-	if t.Token != "" {
-		if err := addFile(files, "token", t.Token); err != nil {
-			return err
-		}
-		serveArgs += fmt.Sprintf(" --token-file %s/token", t.RemoteDir)
-	}
-	if t.Transport == "ws" {
-		serveArgs += " --path " + t.Path
 	}
 
 	opts := deploy.Options{
@@ -115,11 +97,67 @@ func (t *DeployCommand) Run(ctx context.Context) error {
 	return nil
 }
 
-func addFile(files map[string][]byte, name, path string) error {
+// deployPlan resolves which files ship to the VDS and the `serve` arguments
+// that reference them, mirroring serve's two modes: mutual TLS when the cert
+// files are present, key-authenticated when only a token is. With a token, the
+// cert flags' default filenames are allowed to be absent (a token-only deploy);
+// a cert path that exists — or was explicitly required by having no token — is
+// read and shipped.
+func (t *DeployCommand) deployPlan() (map[string][]byte, string, error) {
+	files := map[string][]byte{}
+	certOptional := t.Token != "" // key-authenticated mode needs no cert bundle
+
+	haveCA, err := addFile(files, "ca.pem", t.CACert, certOptional)
+	if err != nil {
+		return nil, "", err
+	}
+	haveCert, err := addFile(files, "relay.crt", t.Cert, certOptional)
+	if err != nil {
+		return nil, "", err
+	}
+	haveKey, err := addFile(files, "relay.key", t.Key, certOptional)
+	if err != nil {
+		return nil, "", err
+	}
+	if haveCert != haveKey {
+		return nil, "", xerrors.Errorf("--cert and --key go together (%s without its pair)", t.Cert)
+	}
+	if !haveCert && t.Token == "" {
+		return nil, "", xerrors.New("provide --token-file (key-authenticated mode) or --cert/--key (mutual TLS)")
+	}
+	if !haveCA && t.Token == "" {
+		return nil, "", xerrors.New("a cert without --ca or a token would run an unauthenticated relay; ship the CA (mutual TLS) and/or a --token-file")
+	}
+
+	serveArgs := fmt.Sprintf("--transport %s --bind %s", t.Transport, t.Bind)
+	if haveCA {
+		serveArgs += fmt.Sprintf(" --ca %s/ca.pem", t.RemoteDir)
+	}
+	if haveCert {
+		serveArgs += fmt.Sprintf(" --cert %s/relay.crt --key %s/relay.key", t.RemoteDir, t.RemoteDir)
+	}
+	if t.Token != "" {
+		if _, err := addFile(files, "token", t.Token, false); err != nil {
+			return nil, "", err
+		}
+		serveArgs += fmt.Sprintf(" --token-file %s/token", t.RemoteDir)
+	}
+	if t.Transport == "ws" {
+		serveArgs += " --path " + t.Path
+	}
+	return files, serveArgs, nil
+}
+
+// addFile reads path into files under name. A missing file is tolerated when
+// optional (reported as absent); any other read error is always fatal.
+func addFile(files map[string][]byte, name, path string, optional bool) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return xerrors.Errorf("read %s: %w", path, err)
+		if optional && os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, xerrors.Errorf("read %s: %w", path, err)
 	}
 	files[name] = data
-	return nil
+	return true, nil
 }

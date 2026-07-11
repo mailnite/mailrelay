@@ -42,14 +42,15 @@ type Config struct {
 // Session is a live tunnel: the value-rpc connection to the relay plus the
 // listeners it is serving.
 type Session struct {
-	cfg    Config
-	log    *zap.Logger
-	cli    valueclient.Client
-	ctl    chan value.Value   // session control channel; closed on Close (relay teardown)
-	cancel context.CancelFunc // cancels the session Chat's context — the signal the relay watches
-	once   sync.Once
+	cfg  Config
+	log  *zap.Logger
+	cli  valueclient.Client
+	once sync.Once
 
 	mu        sync.Mutex
+	ctl       chan value.Value   // session control channel; closed on Close (relay teardown)
+	cancel    context.CancelFunc // cancels the session Chat's context — the signal the relay watches
+	closed    bool
 	listeners map[string]*reverseListener
 }
 
@@ -122,36 +123,71 @@ func serverName(cfg Config) string {
 // and described in the returned BindResults, so the caller can surface the exact
 // remedy. The tunnel lives until Close (or the process exits).
 func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[string]net.Listener, []protocol.BindResult, error) {
+	// One session chat per Session: a second Bind would silently orphan the
+	// first chat's server-side listeners (only the newest would be torn down on
+	// Close), so refuse it instead. The Chat runs under a context this Session
+	// owns and cancels on Close — that cancellation is what the relay watches
+	// (<-ctx.Done()) to tear the session down and release its public ports;
+	// closing the connection alone does not reliably reach an idle handler.
+	chatCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if s.closed || s.ctl != nil {
+		already := s.ctl != nil
+		s.mu.Unlock()
+		cancel()
+		if already {
+			return nil, nil, xerrors.New("Bind was already called on this session")
+		}
+		return nil, nil, xerrors.New("session is closed")
+	}
 	s.ctl = make(chan value.Value)
+	s.cancel = cancel
+	ctl := s.ctl
+	s.mu.Unlock()
+
+	// A Bind that fails to open leaves the session reusable: undo the claim.
+	// Closing ctl releases the chat's send pump; cancel() reaches the relay so a
+	// half-opened server-side session drops its ports.
+	unbind := func() {
+		cancel()
+		s.mu.Lock()
+		owned := s.ctl == ctl
+		if owned {
+			s.ctl, s.cancel = nil, nil
+		}
+		s.mu.Unlock()
+		if owned {
+			close(ctl)
+		}
+	}
+
 	req, err := protocol.Encode(protocol.SessionRequest{
 		Version: protocol.Version,
 		Token:   s.cfg.Token,
 		Binds:   specs,
 	})
 	if err != nil {
+		unbind()
 		return nil, nil, err
 	}
-	// The Chat runs under a context this Session owns and cancels on Close. That
-	// cancellation is what the relay watches (<-ctx.Done()) to tear the session
-	// down and release its public ports — closing the connection alone does not
-	// reliably reach an idle handler, so without this the relay leaks the ports.
-	chatCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-	events, _, err := s.cli.Chat(chatCtx, protocol.FnSession, req, 64, s.ctl)
+	events, _, err := s.cli.Chat(chatCtx, protocol.FnSession, req, 64, ctl)
 	if err != nil {
-		cancel()
+		unbind()
 		return nil, nil, xerrors.Errorf("open session: %w", err)
 	}
 
 	first, ok := <-events
 	if !ok {
+		unbind()
 		return nil, nil, xerrors.New("relay closed the session before it was ready")
 	}
 	var ready protocol.Event
 	if err := protocol.Decode(first, &ready); err != nil {
+		unbind()
 		return nil, nil, err
 	}
 	if ready.Type != protocol.EventReady {
+		unbind()
 		return nil, nil, xerrors.Errorf("expected ready event, got %q", ready.Type)
 	}
 
@@ -174,11 +210,18 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 // pump routes accept events into per-listener queues, opening a conn chat (the
 // byte pipe) for each. It ends when the relay closes the event stream, at which
 // point every listener is closed so the mail servers' Accept loops unwind.
+//
+// Each accept is handled on its own goroutine: opening the conn chat is a
+// relay round trip, and serializing those on this loop would cap connection
+// setup at one-per-RTT across ALL public ports — and let one stalled listener
+// starve every other port's accepts. TCP connections are independent, so
+// per-listener delivery order does not matter.
 func (s *Session) pump(ctx context.Context, events <-chan value.Value) {
 	defer s.closeListeners()
 	for ev := range events {
 		var e protocol.Event
 		if err := protocol.Decode(ev, &e); err != nil {
+			s.log.Warn("RelayBadEvent", zap.Error(err))
 			continue
 		}
 		switch e.Type {
@@ -189,12 +232,17 @@ func (s *Session) pump(ctx context.Context, events <-chan value.Value) {
 			if l == nil {
 				continue
 			}
-			conn, err := s.openConn(ctx, e.ConnID, e.Secret, e.RemoteAddr)
-			if err != nil {
-				s.log.Warn("RelayConnOpenFailed", zap.Int64("connId", e.ConnID), zap.Error(err))
-				continue
-			}
-			l.deliver(conn)
+			go func(e protocol.Event) {
+				conn, err := s.openConn(ctx, e.ConnID, e.Secret, e.RemoteAddr)
+				if err != nil {
+					s.log.Warn("RelayConnOpenFailed", zap.Int64("connId", e.ConnID), zap.Error(err))
+					return
+				}
+				if !l.deliver(conn) {
+					s.log.Warn("RelayAcceptQueueFull",
+						zap.String("listener", e.Name), zap.String("remote", e.RemoteAddr))
+				}
+			}(e)
 		case protocol.EventError:
 			s.log.Warn("RelayEvent", zap.String("message", e.Message))
 		}
@@ -248,11 +296,16 @@ func (s *Session) ProbePorts(ctx context.Context, ports []int) ([]protocol.PortP
 // then the local listeners are closed and the connection shut.
 func (s *Session) Close() error {
 	s.once.Do(func() {
-		if s.cancel != nil {
-			s.cancel() // relay watches this cancellation to release the ports
+		s.mu.Lock()
+		s.closed = true
+		ctl, cancel := s.ctl, s.cancel
+		s.ctl, s.cancel = nil, nil
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel() // relay watches this cancellation to release the ports
 		}
-		if s.ctl != nil {
-			close(s.ctl)
+		if ctl != nil {
+			close(ctl)
 		}
 		s.closeListeners()
 		_ = s.cli.Close()
@@ -299,16 +352,38 @@ func (l *reverseListener) Accept() (net.Conn, error) {
 	}
 }
 
-func (l *reverseListener) deliver(c net.Conn) {
+// deliver queues an established tunneled connection for Accept. When the queue
+// is full — the server behind this listener stopped accepting — the connection
+// is refused (closed) rather than held, exactly as a full kernel accept backlog
+// would refuse it; pending conns must not pile up without bound while the
+// server is stuck. Returns false when the conn was dropped for that reason.
+func (l *reverseListener) deliver(c net.Conn) bool {
 	select {
 	case l.incoming <- c:
+		return true
 	case <-l.closed:
 		_ = c.Close()
+		return true
+	default:
+		_ = c.Close()
+		return false
 	}
 }
 
 func (l *reverseListener) Close() error {
-	l.once.Do(func() { close(l.closed) })
+	l.once.Do(func() {
+		close(l.closed)
+		// Refuse conns already queued but never accepted, so their tunnels end
+		// promptly instead of waiting for the whole session to die.
+		for {
+			select {
+			case c := <-l.incoming:
+				_ = c.Close()
+			default:
+				return
+			}
+		}
+	})
 	return nil
 }
 

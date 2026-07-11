@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -301,7 +302,8 @@ func run(client *ssh.Client, o Options, log *bytes.Buffer, cmd string) error {
 		return err
 	}
 	defer sess.Close()
-	full := maybeSudo(o, cmd)
+	full, stdin := sudoWrap(o, cmd, nil)
+	sess.Stdin = stdin
 	sess.Stdout = log
 	sess.Stderr = log
 	if err := sess.Run(full); err != nil {
@@ -310,19 +312,21 @@ func run(client *ssh.Client, o Options, log *bytes.Buffer, cmd string) error {
 	return nil
 }
 
-// upload streams data to a remote path with the given octal mode.
+// upload streams data to a remote path with the given octal mode. tee and chmod
+// run inside ONE sudo so the data on stdin flows to tee untouched (see sudoWrap
+// for why the password must not ride a pipe in front of it).
 func upload(client *ssh.Client, o Options, log *bytes.Buffer, path string, data []byte, mode string) error {
 	sess, err := client.NewSession()
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
-	sess.Stdin = bytes.NewReader(data)
+	cmd := "tee " + shellQuote(path) + " > /dev/null && chmod " + mode + " " + shellQuote(path)
+	full, stdin := sudoWrap(o, cmd, bytes.NewReader(data))
+	sess.Stdin = stdin
 	sess.Stdout = log
 	sess.Stderr = log
-	// tee to the file (sudo-aware), then set the mode.
-	cmd := maybeSudo(o, "tee "+shellQuote(path)+" > /dev/null") + " && " + maybeSudo(o, "chmod "+mode+" "+shellQuote(path))
-	if err := sess.Run(cmd); err != nil {
+	if err := sess.Run(full); err != nil {
 		return xerrors.Errorf("upload %s: %w", path, err)
 	}
 	fmt.Fprintf(log, "wrote %s (%d bytes)\n", path, len(data))
@@ -384,16 +388,27 @@ func startService(client *ssh.Client, o Options, log *bytes.Buffer) error {
 	return run(client, o, log, "systemctl enable --now mailrelay.service")
 }
 
-// maybeSudo prefixes sudo when the login is not root, feeding the password to
-// sudo -S when one is available.
-func maybeSudo(o Options, cmd string) string {
+// sudoWrap prepares a remote command and its stdin for the login's privilege
+// level. Non-root logins run under sudo; a password is delivered to `sudo -S`
+// by PREPENDING it to the command's stdin (sudo consumes exactly the first
+// line), never via `echo <pw> |` — a pipe in front of sudo both exposes the
+// password in the remote process list and, fatally for uploads, becomes the
+// wrapped command's stdin: tee would read the drained pipe instead of the
+// session stdin and write an empty file.
+func sudoWrap(o Options, cmd string, stdin io.Reader) (string, io.Reader) {
 	if o.User == "root" {
-		return cmd
+		return cmd, stdin
 	}
 	if o.Password != "" {
-		return "echo " + shellQuote(o.Password) + " | sudo -S -p '' sh -c " + shellQuote(cmd)
+		pw := strings.NewReader(o.Password + "\n")
+		if stdin != nil {
+			stdin = io.MultiReader(pw, stdin)
+		} else {
+			stdin = pw
+		}
+		return "sudo -S -p '' sh -c " + shellQuote(cmd), stdin
 	}
-	return "sudo sh -c " + shellQuote(cmd)
+	return "sudo sh -c " + shellQuote(cmd), stdin
 }
 
 // shellQuote single-quotes a string for safe use in a remote shell command.

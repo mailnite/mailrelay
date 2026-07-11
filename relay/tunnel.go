@@ -50,6 +50,7 @@ type Tunnel struct {
 	connSeq int64
 
 	mu       sync.Mutex
+	closed   bool                   // set by Close; refuses new sessions
 	pending  map[int64]*pendingConn // accepted public conns awaiting their conn chat
 	sessions map[*session]struct{}  // every open client session
 }
@@ -137,11 +138,11 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 
 	s := &session{outC: make(chan value.Value, 64), stop: make(chan struct{})}
 	s.onClose = func() { t.removeSession(s) }
-	t.addSession(s)
 
-	// Open the listeners and send the ready event BEFORE any accept loop runs, so
-	// the ready event is always the first message the client reads (an early
-	// inbound connection must not jump ahead of it in the stream).
+	// Open the listeners and queue the ready event BEFORE the session becomes
+	// visible to anyone else: the ready event is always the first message the
+	// client reads (an early inbound connection must not jump ahead of it), and
+	// no concurrent Tunnel.Close can be closing outC under our send.
 	results, bound := t.openListeners(&req, s)
 	ready, err := protocol.Encode(protocol.Event{Type: protocol.EventReady, Binds: results})
 	if err != nil {
@@ -150,8 +151,20 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 	}
 	s.outC <- ready // buffered; the first thing the client reads
 
+	// Reserve the accept loops' WaitGroup slots before the session is published,
+	// so a shutdown that races the loop startup still waits for every loop
+	// before closing outC.
+	s.wg.Add(len(bound))
+	if !t.addSession(s) {
+		// The relay is shutting down: release the reserved slots (no loop ever
+		// starts) and tear the freshly-opened listeners back down.
+		for range bound {
+			s.wg.Done()
+		}
+		s.shutdown()
+		return nil, xerrors.New("relay is shutting down")
+	}
 	for _, bp := range bound {
-		s.wg.Add(1)
 		go t.acceptLoop(bp.spec, bp.ln, s)
 	}
 
@@ -333,10 +346,17 @@ func (t *Tunnel) reap(id int64) {
 	}
 }
 
-func (t *Tunnel) addSession(s *session) {
+// addSession publishes a session, or reports false when the tunnel is already
+// closed — the caller then tears the session down instead of leaking listeners
+// a completed Close would never revisit.
+func (t *Tunnel) addSession(s *session) bool {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return false
+	}
 	t.sessions[s] = struct{}{}
-	t.mu.Unlock()
+	return true
 }
 
 func (t *Tunnel) removeSession(s *session) {
@@ -351,16 +371,28 @@ func (t *Tunnel) sessionCount() int {
 	return len(t.sessions)
 }
 
-// Close tears down every open session (used on relay shutdown).
+// Close tears down every open session and refuses new ones (relay shutdown).
 func (t *Tunnel) Close() {
 	t.mu.Lock()
+	t.closed = true
 	all := make([]*session, 0, len(t.sessions))
 	for s := range t.sessions {
 		all = append(all, s)
 	}
+	// Accepted conns still waiting for their conn chat go down with the relay
+	// (any stragglers an accept loop stashes mid-close are covered by their
+	// claim-timeout reapers).
+	orphans := make([]*pendingConn, 0, len(t.pending))
+	for id, pc := range t.pending {
+		orphans = append(orphans, pc)
+		delete(t.pending, id)
+	}
 	t.mu.Unlock()
 	for _, s := range all {
 		s.shutdown()
+	}
+	for _, pc := range orphans {
+		pc.conn.Close()
 	}
 }
 
@@ -393,10 +425,10 @@ func (s *session) shutdown() {
 
 func randomSecret() string {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand failure is fatal-grade; fall back to a time-seeded value so
-		// the relay keeps working rather than handing out an empty (guessable) one.
-		return hex.EncodeToString([]byte(strconv.FormatInt(time.Now().UnixNano(), 16)))
-	}
+	// crypto/rand.Read never returns an error (it aborts the program if the
+	// platform's random source is broken), so there is no fallback path — and
+	// there must not be: a predictable secret would silently void the
+	// per-connection isolation this capability exists for.
+	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }

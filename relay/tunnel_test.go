@@ -403,6 +403,44 @@ type mismatch struct{ got, want string }
 func (m mismatch) Error() string           { return "echo = " + m.got + ", want " + m.want }
 func errUnexpected(got, want string) error { return mismatch{got, want} }
 
+// TestBindOnlyOnce: a Session carries exactly one session chat. A second Bind
+// must be refused loudly — silently opening a second chat would orphan the
+// first one's server-side listeners (Close would only tear down the newest).
+func TestBindOnlyOnce(t *testing.T) {
+	log := zap.NewNop()
+	ca, _ := pki.GenerateCA("test-ca")
+	server, _ := ca.IssueServerCert([]string{"127.0.0.1"})
+	client, _ := ca.IssueClientCert("mailnite")
+	srvTLS, _ := pki.ServerTLSConfig(server.CertPEM, server.KeyPEM, ca.CertPEM)
+	srv, err := valueserver.NewTLSServer("127.0.0.1:0", srvTLS, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := relay.New(log, "")
+	tun.Register(srv)
+	go srv.Run()
+	defer srv.Close()
+	defer tun.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := relayclient.Dial(ctx, relayclient.Config{
+		Transport: protocol.TransportTCP, Addr: srv.Addr().String(), ServerName: "127.0.0.1",
+		CAPEM: ca.CertPEM, ClientCertPEM: client.CertPEM, ClientKeyPEM: client.KeyPEM,
+	}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	if _, _, err := sess.Bind(ctx, []protocol.PortSpec{{Name: "a", Port: 0, Proto: "tcp"}}); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	if _, _, err := sess.Bind(ctx, []protocol.PortSpec{{Name: "b", Port: 0, Proto: "tcp"}}); err == nil {
+		t.Fatal("second Bind on one session must be refused")
+	}
+}
+
 // TestPrivilegedBindReported checks that a sub-1024 bind failure comes back as a
 // structured, actionable result rather than an opaque error, so onboarding can
 // show the setcap/sysctl remedy. (Run as non-root, port 443 is unbindable.)

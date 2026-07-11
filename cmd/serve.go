@@ -20,6 +20,12 @@ import (
 
 // ServeCommand runs the relay on the VDS. It is the only long-lived command; the
 // rest of the CLI is one-shot key/cert/deploy tooling.
+//
+// The relay server itself is a command-scoped glue bean (CommandBeans): cligo
+// creates a child container around Run, which wires the server's dependencies
+// (logger, this command as its ConfigSource), validates the configuration in
+// PostConstruct, and — via Destroy when the child container closes — guarantees
+// the public ports are released however Run exits.
 type ServeCommand struct {
 	Parent cligo.CliGroup `cli:"group=cli"`
 	Log    *zap.Logger    `inject:""`
@@ -33,7 +39,14 @@ type ServeCommand struct {
 	Key       string `cli:"option=key,default=,env=MAILRELAY_KEY,help=relay server private key PEM"`
 	Token     string `cli:"option=token,default=,env=MAILRELAY_TOKEN,help=handshake token (required for ws)"`
 	TokenFile string `cli:"option=token-file,default=,env=MAILRELAY_TOKEN_FILE,help=file containing the handshake token"`
+
+	server *relay.Server // the command-scoped bean, retained for Run
 }
+
+var (
+	_ cligo.CliCommandWithBeans = (*ServeCommand)(nil)
+	_ relay.ConfigSource        = (*ServeCommand)(nil)
+)
 
 func (t *ServeCommand) Command() string { return "serve" }
 
@@ -41,7 +54,17 @@ func (t *ServeCommand) Help() (string, string) {
 	return "run the relay: bind public ports on this VDS and tunnel them to mailnite", ""
 }
 
-func (t *ServeCommand) Run(ctx context.Context) error {
+// CommandBeans declares the serve scope: the relay server bean (plus whatever
+// it injects from the root container — the logger, and this command as its
+// relay.ConfigSource).
+func (t *ServeCommand) CommandBeans() []interface{} {
+	t.server = relay.NewServer()
+	return []interface{}{t.server}
+}
+
+// RelayConfig implements relay.ConfigSource: the CLI flags (with their env
+// fallbacks) are the configuration source for the injected server bean.
+func (t *ServeCommand) RelayConfig() (relay.Config, error) {
 	cfg := relay.Config{
 		Transport: t.Transport,
 		BindAddr:  t.Bind,
@@ -49,34 +72,35 @@ func (t *ServeCommand) Run(ctx context.Context) error {
 	}
 	var err error
 	if cfg.Token, err = resolveToken(t.Token, t.TokenFile); err != nil {
-		return err
+		return cfg, err
 	}
 	// Two modes: with --cert/--key the relay presents that certificate and (with
 	// --ca) enforces mutual TLS; without them it runs key-authenticated — a
 	// self-signed cert plus the shared --token, which is the simple default.
 	if t.Cert != "" && t.Key != "" {
 		if cfg.CertPEM, err = os.ReadFile(t.Cert); err != nil {
-			return xerrors.Errorf("read cert: %w", err)
+			return cfg, xerrors.Errorf("read cert: %w", err)
 		}
 		if cfg.KeyPEM, err = os.ReadFile(t.Key); err != nil {
-			return xerrors.Errorf("read key: %w", err)
+			return cfg, xerrors.Errorf("read key: %w", err)
 		}
 		if t.CACert != "" {
 			if cfg.CAPEM, err = os.ReadFile(t.CACert); err != nil {
-				return xerrors.Errorf("read ca: %w", err)
+				return cfg, xerrors.Errorf("read ca: %w", err)
 			}
 		}
-	} else if cfg.Token == "" {
-		return xerrors.New("provide --token (key-authenticated mode) or --cert/--key (mutual TLS)")
 	}
+	return cfg, nil
+}
 
+func (t *ServeCommand) Run(ctx context.Context) error {
 	// Translate SIGINT/SIGTERM into ctx cancellation so systemd stop / Ctrl-C
-	// unbinds the ports cleanly.
+	// unbinds the ports cleanly even under a non-signal-aware parent context.
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	t.Log.Info("RelayStart", zap.String("transport", cfg.Transport), zap.String("bind", cfg.BindAddr))
-	return relay.Serve(sctx, cfg, t.Log)
+	t.Log.Info("RelayStart", zap.String("transport", t.Transport), zap.String("bind", t.Bind))
+	return t.server.Serve(sctx)
 }
 
 func resolveToken(token, tokenFile string) (string, error) {

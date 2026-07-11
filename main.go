@@ -37,7 +37,9 @@ func main() {
 		cligo.Version(Version),
 		cligo.Build(Build),
 		cligo.Beans(
-			// A production zap logger, injected into the serve command.
+			// A production zap logger, injected into the serve and ping commands
+			// (and, through the serve command's child container, into the relay
+			// server bean).
 			servion.ZapLogFactory(false),
 			&cmd.ServeCommand{},
 			&cmd.PingCommand{},
