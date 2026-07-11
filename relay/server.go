@@ -37,6 +37,12 @@ type Config struct {
 	// in the session request. It is the client-auth factor for ws (whose TLS is
 	// server-authenticated only); optional belt-and-braces for tcp/quic.
 	Token string
+
+	// Version and Build identify this relay binary; reported to a connected
+	// mailnite over the info RPC so its dashboard can show the relay it tunnels
+	// through. Empty is fine (shown as unknown).
+	Version string
+	Build   string
 }
 
 // ConfigSource supplies the relay Server bean its configuration. The serve
@@ -117,6 +123,7 @@ func (t *Server) PostConstruct() error {
 	}
 	t.cfg = cfg
 	t.tun = New(t.Log, cfg.Token)
+	t.tun.SetInfo(cfg.Version, cfg.Build)
 	return nil
 }
 

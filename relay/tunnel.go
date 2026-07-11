@@ -44,8 +44,10 @@ const connClaimTimeout = 15 * time.Second
 
 // Tunnel is the relay's value-rpc service, shared by every connected client.
 type Tunnel struct {
-	log   *zap.Logger
-	token string // when set, required in the session request (ws transport auth)
+	log     *zap.Logger
+	token   string // when set, required in the session request (ws transport auth)
+	version string // this relay binary's version, reported over FnInfo
+	build   string // this relay binary's build, reported over FnInfo
 
 	connSeq int64
 
@@ -73,10 +75,20 @@ func New(log *zap.Logger, token string) *Tunnel {
 	}
 }
 
+// SetInfo records the relay binary's version/build, reported to clients over the
+// info RPC so the mailnite dashboard can show which relay it is tunnelling
+// through. Call before Register.
+func (t *Tunnel) SetInfo(version, build string) {
+	t.version, t.build = version, build
+}
+
 // Register installs the tunnel's handlers on a value-rpc endpoint (the relay
 // server, or in tests a client that serves reverse calls).
 func (t *Tunnel) Register(r valuerpc.Registrar) error {
 	if err := r.AddFunction(protocol.FnPing, valuerpc.Any, valuerpc.String, t.ping); err != nil {
+		return err
+	}
+	if err := r.AddFunction(protocol.FnInfo, valuerpc.Any, valuerpc.Any, t.info); err != nil {
 		return err
 	}
 	if err := r.AddFunction(protocol.FnProbe, valuerpc.Any, valuerpc.Any, t.probe); err != nil {
@@ -90,6 +102,12 @@ func (t *Tunnel) Register(r valuerpc.Registrar) error {
 
 func (t *Tunnel) ping(_ context.Context, _ value.Value) (value.Value, error) {
 	return value.Utf8("pong"), nil
+}
+
+// info returns this relay binary's version and build, so a connected mailnite
+// can show which relay it is tunnelling through alongside its own version.
+func (t *Tunnel) info(_ context.Context, _ value.Value) (value.Value, error) {
+	return protocol.Encode(protocol.RelayInfo{Version: t.version, Build: t.build})
 }
 
 // probe is a unary bindability check: for each requested port it binds and

@@ -31,6 +31,10 @@ var (
 )
 
 func main() {
+	// Hand the ldflags-stamped version/build to the serve command so it can
+	// report them to a connected mailnite over the info RPC (shown in the admin
+	// dashboard beside mailnite's own version).
+	cmd.Version, cmd.Build = Version, Build
 	cligo.Main(
 		cligo.Name("mailrelay"),
 		cligo.Title("Mailnite reverse relay"),

@@ -278,6 +278,22 @@ func (s *Session) Ping(ctx context.Context) error {
 	return err
 }
 
+// Info asks the relay for its version and build, so mailnite can show which
+// relay binary it is tunnelling through. A relay too old to implement the info
+// RPC returns an unknown-function error; the caller should treat that as
+// "connected, version unknown" rather than a failure.
+func (s *Session) Info(ctx context.Context) (protocol.RelayInfo, error) {
+	var info protocol.RelayInfo
+	res, err := s.cli.CallFunction(ctx, protocol.FnInfo, value.Null)
+	if err != nil {
+		return info, err
+	}
+	if err := protocol.Decode(res, &info); err != nil {
+		return info, err
+	}
+	return info, nil
+}
+
 // ProbePorts asks the relay whether it can bind each port on the VDS — a unary
 // call that binds and immediately releases each, so it never occupies or leaks a
 // public port and can be repeated freely (no Bind/session needed, just a dialed

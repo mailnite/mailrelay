@@ -441,6 +441,45 @@ func TestBindOnlyOnce(t *testing.T) {
 	}
 }
 
+// TestTunnelInfo: the relay reports its version/build over the info RPC, so a
+// connected mailnite can show which relay binary it tunnels through.
+func TestTunnelInfo(t *testing.T) {
+	log := zap.NewNop()
+	ca, _ := pki.GenerateCA("test-ca")
+	server, _ := ca.IssueServerCert([]string{"127.0.0.1"})
+	client, _ := ca.IssueClientCert("mailnite")
+	srvTLS, _ := pki.ServerTLSConfig(server.CertPEM, server.KeyPEM, ca.CertPEM)
+	srv, err := valueserver.NewTLSServer("127.0.0.1:0", srvTLS, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := relay.New(log, "")
+	tun.SetInfo("v9.9.9", "2026-07-11")
+	tun.Register(srv)
+	go srv.Run()
+	defer srv.Close()
+	defer tun.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := relayclient.Dial(ctx, relayclient.Config{
+		Transport: protocol.TransportTCP, Addr: srv.Addr().String(), ServerName: "127.0.0.1",
+		CAPEM: ca.CertPEM, ClientCertPEM: client.CertPEM, ClientKeyPEM: client.KeyPEM,
+	}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	info, err := sess.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+	if info.Version != "v9.9.9" || info.Build != "2026-07-11" {
+		t.Fatalf("info = %+v, want {v9.9.9 2026-07-11}", info)
+	}
+}
+
 // TestPrivilegedBindReported checks that a sub-1024 bind failure comes back as a
 // structured, actionable result rather than an opaque error, so onboarding can
 // show the setcap/sysctl remedy. (Run as non-root, port 443 is unbindable.)

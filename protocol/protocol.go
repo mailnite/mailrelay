@@ -44,7 +44,20 @@ const (
 	FnSession = "session"
 	FnConn    = "conn"
 	FnProbe   = "probe"
+	FnInfo    = "info"
 )
+
+// RelayInfo is the relay's self-report: the version and build of the mailrelay
+// binary actually running on the VDS. mailnite has no other way to know it — the
+// relay is deployed and updated independently (its own installer + self-update
+// timer) — so it asks over the tunnel and shows it in the admin dashboard beside
+// its own version. An older relay that predates FnInfo simply returns an
+// unknown-function error; the caller treats that as "connected, version
+// unknown" rather than a failure.
+type RelayInfo struct {
+	Version string `value:"version,omitempty"`
+	Build   string `value:"build,omitempty"`
+}
 
 // ProbeRequest asks the relay whether it can bind each public port on the VDS.
 // It is a unary probe: the relay binds each port, immediately releases it, and

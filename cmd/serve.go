@@ -43,6 +43,14 @@ type ServeCommand struct {
 	server *relay.Server // the command-scoped bean, retained for Run
 }
 
+// Version and Build identify the relay binary; main sets them from its
+// ldflags-stamped vars before cligo runs, so the serve command can report them
+// to a connected mailnite over the info RPC (shown in its admin dashboard).
+var (
+	Version string
+	Build   string
+)
+
 var (
 	_ cligo.CliCommandWithBeans = (*ServeCommand)(nil)
 	_ relay.ConfigSource        = (*ServeCommand)(nil)
@@ -69,6 +77,8 @@ func (t *ServeCommand) RelayConfig() (relay.Config, error) {
 		Transport: t.Transport,
 		BindAddr:  t.Bind,
 		Path:      t.Path,
+		Version:   Version,
+		Build:     Build,
 	}
 	var err error
 	if cfg.Token, err = resolveToken(t.Token, t.TokenFile); err != nil {
