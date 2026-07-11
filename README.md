@@ -12,8 +12,8 @@ outbound** — so your NAT/firewall never needs an inbound hole.
 
 ```
    public internet                         your LAN / behind NAT
-  ┌───────────────┐   outbound, mutual-TLS   ┌──────────────────┐
-  │    mailrelay   │◀───── value-rpc ─────────│     mailnite     │
+  ┌──────────-─────┐    outbound, mutual-TLS   ┌──────────────────┐
+  │    mailrelay   │◀───── value-rpc ─────-────│     mailnite     │
   │  (public VDS)  │   (mailnite dials out)    │  (no public IP)  │
   │                │                           │                  │
   │ binds :25 :443 │   raw bytes both ways     │ Serve(listener)  │
