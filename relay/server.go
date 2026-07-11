@@ -120,6 +120,16 @@ func (t *Server) PostConstruct() error {
 	return nil
 }
 
+// sessionRetention bounds how long the value-rpc layer keeps a DISCONNECTED
+// client's session alive for a transport reconnect. The default (2 minutes) is
+// tuned for ordinary RPC state; here a session holds this VDS's PUBLIC MAIL
+// PORTS, and the mailnite supervisor never resumes a dead session — it always
+// dials a fresh one and rebinds. Every second of retention is therefore a
+// second a crashed/redeployed mailnite's zombie session keeps :25/:443/:465
+// bound, answering EADDRINUSE to its own successor. Keep it just long enough
+// to ride out a genuine transport blip.
+const sessionRetention = 10 * time.Second
+
 // Serve binds the configured transport and runs the relay until ctx is
 // cancelled or Shutdown/Destroy is called. It always releases the tunnel's
 // public listeners and sessions on the way out.
@@ -141,7 +151,8 @@ func (t *Server) Serve(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		srv, err := valueserver.NewTLSServer(t.cfg.BindAddr, tlsCfg, t.Log)
+		srv, err := valueserver.NewTLSServer(t.cfg.BindAddr, tlsCfg, t.Log,
+			valueserver.WithSessionRetention(sessionRetention))
 		if err != nil {
 			return err
 		}
@@ -153,7 +164,14 @@ func (t *Server) Serve(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		srv, err := valuequic.NewServer(t.cfg.BindAddr, tlsCfg, t.Log)
+		// valuequic.NewServer does not plumb server options; compose the listener
+		// and server directly so the session retention applies here too.
+		lis, err := valuequic.NewListener(t.cfg.BindAddr, tlsCfg, valueserver.DefaultTimeout)
+		if err != nil {
+			return err
+		}
+		srv, err := valueserver.NewServerWithListener(lis, t.Log,
+			valueserver.WithSessionRetention(sessionRetention))
 		if err != nil {
 			return err
 		}
@@ -246,7 +264,8 @@ func (t *Server) serveWSS(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	srv, handler, err := valueserver.NewWebSocketHandler(t.Log)
+	srv, handler, err := valueserver.NewWebSocketHandler(t.Log,
+		valueserver.WithSessionRetention(sessionRetention))
 	if err != nil {
 		return err
 	}

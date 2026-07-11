@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/mailnite/mailrelay/pki"
 	"github.com/mailnite/mailrelay/protocol"
@@ -50,6 +51,7 @@ type Session struct {
 	mu        sync.Mutex
 	ctl       chan value.Value   // session control channel; closed on Close (relay teardown)
 	cancel    context.CancelFunc // cancels the session Chat's context — the signal the relay watches
+	pumpDone  chan struct{}      // closed when the relay ends the event stream (teardown ack)
 	closed    bool
 	listeners map[string]*reverseListener
 }
@@ -201,9 +203,14 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 		s.listeners[b.Name] = l
 		out[b.Name] = l
 	}
+	done := make(chan struct{})
+	s.pumpDone = done
 	s.mu.Unlock()
 
-	go s.pump(chatCtx, events)
+	go func() {
+		defer close(done) // the relay closed the event stream: teardown acknowledged
+		s.pump(chatCtx, events)
+	}()
 	return out, ready.Binds, nil
 }
 
@@ -291,21 +298,36 @@ func (s *Session) ProbePorts(ctx context.Context, ports []int) ([]protocol.PortP
 	return out.Ports, nil
 }
 
-// Close tears down the tunnel: cancelling the session Chat's context signals the
-// relay to drop this client's public listeners (the reliable teardown trigger),
-// then the local listeners are closed and the connection shut.
+// Close tears down the tunnel: cancelling the session Chat's context and
+// half-closing the control channel signal the relay to drop this client's
+// public listeners, then the local listeners are closed and the connection
+// shut. Close WAITS (bounded) for the relay to end the event stream before
+// killing the transport: both teardown signals travel the connection's async
+// sender, so closing it immediately could cut them off mid-flight — leaving a
+// zombie session holding the public ports on the relay until it next tries to
+// write (which is exactly what made a mailnite in-place restart EADDRINUSE
+// against its own previous session).
 func (s *Session) Close() error {
 	s.once.Do(func() {
 		s.mu.Lock()
 		s.closed = true
-		ctl, cancel := s.ctl, s.cancel
+		ctl, cancel, done := s.ctl, s.cancel, s.pumpDone
 		s.ctl, s.cancel = nil, nil
 		s.mu.Unlock()
 		if cancel != nil {
 			cancel() // relay watches this cancellation to release the ports
 		}
 		if ctl != nil {
-			close(ctl)
+			close(ctl) // half-close: the relay's second teardown trigger
+		}
+		if done != nil {
+			select {
+			case <-done: // relay closed the session stream — ports are released
+			case <-time.After(5 * time.Second): // relay unreachable; close anyway
+				s.log.Warn("RelayCloseNotAcknowledged",
+					zap.String("relay", s.cfg.Addr),
+					zap.String("effect", "its listeners release when it notices the dropped connection"))
+			}
 		}
 		s.closeListeners()
 		_ = s.cli.Close()
