@@ -42,11 +42,12 @@ type Config struct {
 // Session is a live tunnel: the value-rpc connection to the relay plus the
 // listeners it is serving.
 type Session struct {
-	cfg  Config
-	log  *zap.Logger
-	cli  valueclient.Client
-	ctl  chan value.Value // session control channel; closed on Close (relay teardown)
-	once sync.Once
+	cfg    Config
+	log    *zap.Logger
+	cli    valueclient.Client
+	ctl    chan value.Value   // session control channel; closed on Close (relay teardown)
+	cancel context.CancelFunc // cancels the session Chat's context — the signal the relay watches
+	once   sync.Once
 
 	mu        sync.Mutex
 	listeners map[string]*reverseListener
@@ -130,8 +131,15 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 	if err != nil {
 		return nil, nil, err
 	}
-	events, _, err := s.cli.Chat(ctx, protocol.FnSession, req, 64, s.ctl)
+	// The Chat runs under a context this Session owns and cancels on Close. That
+	// cancellation is what the relay watches (<-ctx.Done()) to tear the session
+	// down and release its public ports — closing the connection alone does not
+	// reliably reach an idle handler, so without this the relay leaks the ports.
+	chatCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+	events, _, err := s.cli.Chat(chatCtx, protocol.FnSession, req, 64, s.ctl)
 	if err != nil {
+		cancel()
 		return nil, nil, xerrors.Errorf("open session: %w", err)
 	}
 
@@ -159,7 +167,7 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 	}
 	s.mu.Unlock()
 
-	go s.pump(ctx, events)
+	go s.pump(chatCtx, events)
 	return out, ready.Binds, nil
 }
 
@@ -215,11 +223,34 @@ func (s *Session) Ping(ctx context.Context) error {
 	return err
 }
 
-// Close tears down the tunnel: closing the control channel tells the relay to
-// drop the public listeners, then the local listeners are closed and the
-// connection shut.
+// ProbePorts asks the relay whether it can bind each port on the VDS — a unary
+// call that binds and immediately releases each, so it never occupies or leaks a
+// public port and can be repeated freely (no Bind/session needed, just a dialed
+// connection). Results come back one per requested port.
+func (s *Session) ProbePorts(ctx context.Context, ports []int) ([]protocol.PortProbe, error) {
+	arg, err := protocol.Encode(protocol.ProbeRequest{Ports: ports})
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.cli.CallFunction(ctx, protocol.FnProbe, arg)
+	if err != nil {
+		return nil, err
+	}
+	var out protocol.ProbeResult
+	if err := protocol.Decode(res, &out); err != nil {
+		return nil, err
+	}
+	return out.Ports, nil
+}
+
+// Close tears down the tunnel: cancelling the session Chat's context signals the
+// relay to drop this client's public listeners (the reliable teardown trigger),
+// then the local listeners are closed and the connection shut.
 func (s *Session) Close() error {
 	s.once.Do(func() {
+		if s.cancel != nil {
+			s.cancel() // relay watches this cancellation to release the ports
+		}
 		if s.ctl != nil {
 			close(s.ctl)
 		}

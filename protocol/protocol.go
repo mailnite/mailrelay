@@ -43,7 +43,29 @@ const (
 	FnPing    = "ping"
 	FnSession = "session"
 	FnConn    = "conn"
+	FnProbe   = "probe"
 )
+
+// ProbeRequest asks the relay whether it can bind each public port on the VDS.
+// It is a unary probe: the relay binds each port, immediately releases it, and
+// returns the outcome — nothing stays bound, so a check never occupies or leaks
+// a public port (unlike opening a session, whose listeners persist).
+type ProbeRequest struct {
+	Ports []int `value:"ports,omitempty"`
+}
+
+// PortProbe is the outcome of binding one port during a ProbeRequest.
+type PortProbe struct {
+	Port       int    `value:"port,omitempty"`
+	OK         bool   `value:"ok,omitempty"`
+	Error      string `value:"error,omitempty"`
+	Privileged bool   `value:"privileged,omitempty"` // sub-1024 bind failed for lack of capability
+}
+
+// ProbeResult is the reply to a ProbeRequest — one PortProbe per requested port.
+type ProbeResult struct {
+	Ports []PortProbe `value:"ports,omitempty"`
+}
 
 // Version is the protocol revision mailnite announces in SessionRequest; the
 // relay rejects a mismatch so an old client meets a clear error, not a silent

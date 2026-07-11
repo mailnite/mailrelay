@@ -78,6 +78,9 @@ func (t *Tunnel) Register(r valuerpc.Registrar) error {
 	if err := r.AddFunction(protocol.FnPing, valuerpc.Any, valuerpc.String, t.ping); err != nil {
 		return err
 	}
+	if err := r.AddFunction(protocol.FnProbe, valuerpc.Any, valuerpc.Any, t.probe); err != nil {
+		return err
+	}
 	if err := r.AddChat(protocol.FnSession, valuerpc.Any, t.session); err != nil {
 		return err
 	}
@@ -86,6 +89,34 @@ func (t *Tunnel) Register(r valuerpc.Registrar) error {
 
 func (t *Tunnel) ping(_ context.Context, _ value.Value) (value.Value, error) {
 	return value.Utf8("pong"), nil
+}
+
+// probe is a unary bindability check: for each requested port it binds and
+// immediately releases the listener, returning the outcome. Because nothing
+// stays bound, a caller can probe the public ports (25/443/…) repeatedly with no
+// risk of occupying or leaking them — unlike opening a session, whose listeners
+// live for the session's lifetime.
+func (t *Tunnel) probe(_ context.Context, arg value.Value) (value.Value, error) {
+	var req protocol.ProbeRequest
+	if err := protocol.Decode(arg, &req); err != nil {
+		return nil, xerrors.Errorf("probe request: %w", err)
+	}
+	var res protocol.ProbeResult
+	for _, port := range req.Ports {
+		p := protocol.PortProbe{Port: port}
+		ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+		if err != nil {
+			p.Error = err.Error()
+			if port < 1024 && errors.Is(err, syscall.EACCES) {
+				p.Privileged = true
+			}
+		} else {
+			p.OK = true
+			_ = ln.Close() // release immediately — the probe never holds the port
+		}
+		res.Ports = append(res.Ports, p)
+	}
+	return protocol.Encode(res)
 }
 
 // session is one client's control chat. It authenticates, opens that client's
