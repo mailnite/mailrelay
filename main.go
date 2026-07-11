@@ -40,6 +40,7 @@ func main() {
 			// A production zap logger, injected into the serve command.
 			servion.ZapLogFactory(false),
 			&cmd.ServeCommand{},
+			&cmd.PingCommand{},
 			&cmd.GenCACommand{},
 			&cmd.GenCertsCommand{},
 			&cmd.GenSSHKeyCommand{},
