@@ -22,14 +22,17 @@ import (
 type DeployCommand struct {
 	Parent cligo.CliGroup `cli:"group=cli"`
 
-	Host      string `cli:"option=host,default=,help=VDS public IP or domain"`
-	Port      int    `cli:"option=port,default=22,help=SSH port"`
-	User      string `cli:"option=user,default=root,help=SSH user (root or a sudoer)"`
-	SSHKey    string `cli:"option=ssh-key,default=,help=SSH private key file (id_ed25519)"`
-	Password  string `cli:"option=password,default=,help=SSH/sudo password (if not using a key)"`
-	HostKey   string `cli:"option=host-key,default=,help=expected SSH host key (authorized_keys form); empty = trust on first use"`
-	Binary    string `cli:"option=binary,default=mailrelay,help=path to the linux mailrelay binary to ship"`
-	RemoteDir string `cli:"option=remote-dir,default=/opt/mailrelay,help=install directory on the VDS"`
+	Host          string `cli:"option=host,default=,help=VDS public IP or domain"`
+	Port          int    `cli:"option=port,default=22,help=SSH port"`
+	User          string `cli:"option=user,default=root,help=SSH user (root or a sudoer)"`
+	SSHKey        string `cli:"option=ssh-key,default=,help=SSH private key file; default: ssh-agent then ~/.ssh/id_*"`
+	KeyPassphrase string `cli:"option=ssh-key-passphrase,default=,help=passphrase for an encrypted --ssh-key"`
+	Password      string `cli:"option=password,default=,help=SSH/sudo password (fallback; key auth is preferred)"`
+	NoAgent       bool   `cli:"option=no-agent,help=do not use ssh-agent even if SSH_AUTH_SOCK is set"`
+	NoDefaultKeys bool   `cli:"option=no-default-keys,help=do not fall back to ~/.ssh/id_* identity files"`
+	HostKey       string `cli:"option=host-key,default=,help=expected SSH host key (authorized_keys form); empty = trust on first use"`
+	Binary        string `cli:"option=binary,default=mailrelay,help=path to the linux mailrelay binary to ship"`
+	RemoteDir     string `cli:"option=remote-dir,default=/opt/mailrelay,help=install directory on the VDS"`
 
 	Transport  string `cli:"option=transport,default=tcp,help=transport the tunnel rides: tcp | ws | quic (tls accepted as a legacy alias of tcp)"`
 	Bind       string `cli:"option=bind,default=0.0.0.0:8443,help=address the relay listens on"`
@@ -84,6 +87,8 @@ func (t *DeployCommand) Run(ctx context.Context) error {
 		Port:            t.Port,
 		User:            t.User,
 		Password:        t.Password,
+		NoAgent:         t.NoAgent,
+		NoDefaultKeys:   t.NoDefaultKeys,
 		HostKey:         t.HostKey,
 		BinaryPath:      bin,
 		RemoteDir:       t.RemoteDir,
@@ -96,6 +101,9 @@ func (t *DeployCommand) Run(ctx context.Context) error {
 		if opts.PrivateKeyPEM, err = os.ReadFile(t.SSHKey); err != nil {
 			return xerrors.Errorf("read ssh key: %w", err)
 		}
+	}
+	if t.KeyPassphrase != "" {
+		opts.KeyPassphrase = []byte(t.KeyPassphrase)
 	}
 
 	log, err := deploy.Deploy(ctx, opts)

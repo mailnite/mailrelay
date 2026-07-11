@@ -122,7 +122,7 @@ func serverName(cfg Config) string {
 // remedy. The tunnel lives until Close (or the process exits).
 func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[string]net.Listener, []protocol.BindResult, error) {
 	s.ctl = make(chan value.Value)
-	req, err := protocol.EncodeJSON(protocol.SessionRequest{
+	req, err := protocol.Encode(protocol.SessionRequest{
 		Version: protocol.Version,
 		Token:   s.cfg.Token,
 		Binds:   specs,
@@ -140,7 +140,7 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 		return nil, nil, xerrors.New("relay closed the session before it was ready")
 	}
 	var ready protocol.Event
-	if err := protocol.DecodeJSON(first, &ready); err != nil {
+	if err := protocol.Decode(first, &ready); err != nil {
 		return nil, nil, err
 	}
 	if ready.Type != protocol.EventReady {
@@ -170,7 +170,7 @@ func (s *Session) pump(ctx context.Context, events <-chan value.Value) {
 	defer s.closeListeners()
 	for ev := range events {
 		var e protocol.Event
-		if err := protocol.DecodeJSON(ev, &e); err != nil {
+		if err := protocol.Decode(ev, &e); err != nil {
 			continue
 		}
 		switch e.Type {
@@ -198,7 +198,7 @@ func (s *Session) pump(ctx context.Context, events <-chan value.Value) {
 // owns the connection (the relay only sent it on this client's session stream).
 func (s *Session) openConn(ctx context.Context, connID int64, secret, remoteAddr string) (net.Conn, error) {
 	put := make(chan value.Value, 16)
-	args, err := protocol.EncodeJSON(protocol.ConnArgs{ConnID: connID, Secret: secret})
+	args, err := protocol.Encode(protocol.ConnArgs{ConnID: connID, Secret: secret})
 	if err != nil {
 		return nil, err
 	}

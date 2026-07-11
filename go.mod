@@ -6,8 +6,8 @@ require (
 	go.arpabet.com/cligo v0.5.1
 	go.arpabet.com/servion v1.5.5
 	go.arpabet.com/value v1.3.1
-	go.arpabet.com/value-rpc v1.5.2
-	go.arpabet.com/value-rpc/quic v1.5.2
+	go.arpabet.com/value-rpc v1.5.5
+	go.arpabet.com/value-rpc/quic v1.5.5
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.53.0
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da

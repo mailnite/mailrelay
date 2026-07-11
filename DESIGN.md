@@ -80,8 +80,13 @@ just a setup detail — but it is the detail that defeats NAT.
 
 ### 2.3 The protocol (three RPCs)
 
-See [`protocol/protocol.go`](protocol/protocol.go). Control messages are small
-JSON documents in a `value.String`; only the byte path uses `value.Raw`.
+See [`protocol/protocol.go`](protocol/protocol.go). Everything on the wire is a
+native value message — control documents (session/conn arguments, session
+events) are value maps marshaled from the tagged protocol structs
+(`value.Marshal`/`value.Unmarshal`, exposed as `protocol.Codec[T]` for
+value-rpc's typed helpers), and the high-rate byte path is untagged `value.Raw`
+chunks. One msgpack encoding end to end — no JSON inside the stream, no second
+serializer inside the first.
 
 - **`session`** (chat) — mailnite opens one, naming the public ports it wants.
   The relay opens those listeners on the VDS and streams back a `ready` event

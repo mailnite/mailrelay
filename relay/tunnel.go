@@ -94,7 +94,7 @@ func (t *Tunnel) ping(_ context.Context, _ value.Value) (value.Value, error) {
 // chat ends — other clients are unaffected.
 func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value.Value) (<-chan value.Value, error) {
 	var req protocol.SessionRequest
-	if err := protocol.DecodeJSON(args, &req); err != nil {
+	if err := protocol.Decode(args, &req); err != nil {
 		return nil, xerrors.Errorf("session request: %w", err)
 	}
 	if req.Version != protocol.Version {
@@ -112,7 +112,7 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 	// the ready event is always the first message the client reads (an early
 	// inbound connection must not jump ahead of it in the stream).
 	results, bound := t.openListeners(&req, s)
-	ready, err := protocol.EncodeJSON(protocol.Event{Type: protocol.EventReady, Binds: results})
+	ready, err := protocol.Encode(protocol.Event{Type: protocol.EventReady, Binds: results})
 	if err != nil {
 		s.shutdown()
 		return nil, err
@@ -189,7 +189,7 @@ func (t *Tunnel) acceptLoop(spec protocol.PortSpec, ln net.Listener, s *session)
 			return // listener closed on shutdown
 		}
 		id, secret := t.stash(c)
-		ev, encErr := protocol.EncodeJSON(protocol.Event{
+		ev, encErr := protocol.Encode(protocol.Event{
 			Type:       protocol.EventAccept,
 			ConnID:     id,
 			Secret:     secret,
@@ -215,7 +215,7 @@ func (t *Tunnel) acceptLoop(spec protocol.PortSpec, ln net.Listener, s *session)
 // ways until either side closes.
 func (t *Tunnel) conn(ctx context.Context, args value.Value, inC <-chan value.Value) (<-chan value.Value, error) {
 	var ca protocol.ConnArgs
-	if err := protocol.DecodeJSON(args, &ca); err != nil {
+	if err := protocol.Decode(args, &ca); err != nil {
 		return nil, xerrors.Errorf("conn args: %w", err)
 	}
 	pc := t.claim(ca.ConnID, ca.Secret)

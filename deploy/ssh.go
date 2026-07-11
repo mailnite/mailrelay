@@ -18,11 +18,14 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/xerrors"
 )
 
@@ -56,8 +59,16 @@ type Options struct {
 	Port int    // SSH port (default 22)
 	User string // SSH user; "root" or a sudoer
 
-	PrivateKeyPEM []byte // SSH auth key (preferred)
-	Password      string // or a password (also used for sudo -S when User != root)
+	// SSH authentication. The preferred path is a private key; a password is a
+	// fallback (and is also fed to sudo -S when User != root). authMethods tries,
+	// in order: an explicit PrivateKeyPEM, then a running ssh-agent
+	// (SSH_AUTH_SOCK), then the default ~/.ssh identity files — so `deploy --host X`
+	// authenticates with the operator's existing key setup and no password at all.
+	PrivateKeyPEM []byte // explicit SSH private key PEM (from --ssh-key)
+	KeyPassphrase []byte // passphrase for an encrypted PrivateKeyPEM (optional)
+	Password      string // password auth fallback / sudo credential
+	NoAgent       bool   // do not consult ssh-agent even if SSH_AUTH_SOCK is set
+	NoDefaultKeys bool   // do not fall back to ~/.ssh/id_* identity files
 
 	// HostKey, if set, is the expected server host key (authorized_keys form); the
 	// connection is rejected on mismatch. Empty means trust-on-first-use: the key
@@ -125,22 +136,120 @@ func Deploy(ctx context.Context, o Options) (string, error) {
 	return log.String(), nil
 }
 
+// authMethods assembles the SSH auth methods to offer, preferring public-key
+// auth over a password. Order of preference:
+//
+//  1. an explicit private key (--ssh-key), passphrase-decrypted if needed;
+//  2. a running ssh-agent (SSH_AUTH_SOCK) — the common "my key, no file" path;
+//  3. the default ~/.ssh identity files (id_ed25519, id_ecdsa, id_rsa);
+//  4. a password, if one was given, as a last-resort fallback.
+//
+// So a bare `deploy --host X` uses the operator's existing key setup with no
+// password at all; a password is never required and only used if provided.
 func authMethods(o Options) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
+	var notes []string // why the key paths didn't contribute, for a good final error
+
 	if len(o.PrivateKeyPEM) > 0 {
-		signer, err := ssh.ParsePrivateKey(o.PrivateKeyPEM)
+		signer, err := parseKey(o.PrivateKeyPEM, o.KeyPassphrase)
 		if err != nil {
-			return nil, xerrors.Errorf("parse deploy key: %w", err)
+			// An explicit key that won't parse is a hard error — the operator
+			// named it, so silently falling through would hide their mistake.
+			return nil, xerrors.Errorf("parse ssh key: %w", err)
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
+
+	if !o.NoAgent {
+		if signers, err := agentSigners(); err != nil {
+			notes = append(notes, "ssh-agent: "+err.Error())
+		} else if len(signers) > 0 {
+			methods = append(methods, ssh.PublicKeys(signers...))
+		}
+	}
+
+	if !o.NoDefaultKeys {
+		signers, note := defaultKeySigners(o.KeyPassphrase)
+		if len(signers) > 0 {
+			methods = append(methods, ssh.PublicKeys(signers...))
+		}
+		if note != "" {
+			notes = append(notes, note)
+		}
+	}
+
 	if o.Password != "" {
 		methods = append(methods, ssh.Password(o.Password))
 	}
+
 	if len(methods) == 0 {
-		return nil, xerrors.New("no SSH credentials: provide a private key or a password")
+		msg := "no SSH credentials: pass --ssh-key, start an ssh-agent, put a key at ~/.ssh/id_ed25519, or pass --password"
+		if len(notes) > 0 {
+			msg += " (" + strings.Join(notes, "; ") + ")"
+		}
+		return nil, xerrors.New(msg)
 	}
 	return methods, nil
+}
+
+// parseKey parses a private key PEM, transparently handling passphrase-encrypted
+// keys: it tries an unencrypted parse first, and only if the key is encrypted
+// does it require (and use) the passphrase.
+func parseKey(pemBytes, passphrase []byte) (ssh.Signer, error) {
+	signer, err := ssh.ParsePrivateKey(pemBytes)
+	if err == nil {
+		return signer, nil
+	}
+	var missing *ssh.PassphraseMissingError
+	if xerrors.As(err, &missing) {
+		if len(passphrase) == 0 {
+			return nil, xerrors.New("key is passphrase-protected; supply --ssh-key-passphrase (or add it to your ssh-agent)")
+		}
+		return ssh.ParsePrivateKeyWithPassphrase(pemBytes, passphrase)
+	}
+	return nil, err
+}
+
+// agentSigners returns the signers a running ssh-agent offers, or (nil, nil)
+// when no agent is available. The agent connection is intentionally left open
+// for the process lifetime: its signers sign lazily during the SSH handshake.
+func agentSigners() ([]ssh.Signer, error) {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return nil, nil
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, err
+	}
+	return agent.NewClient(conn).Signers()
+}
+
+// defaultKeySigners loads the standard ~/.ssh identity files, mirroring what the
+// ssh client tries by default. Missing files are skipped silently; a file that
+// exists but is encrypted without a supplied passphrase is skipped with a note
+// (it may still be covered by the agent).
+func defaultKeySigners(passphrase []byte) ([]ssh.Signer, string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, ""
+	}
+	var signers []ssh.Signer
+	var notes []string
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		path := filepath.Join(home, ".ssh", name)
+		pemBytes, err := os.ReadFile(path)
+		if err != nil {
+			continue // no such default key — normal
+		}
+		signer, err := parseKey(pemBytes, passphrase)
+		if err != nil {
+			notes = append(notes, name+": "+err.Error())
+			continue
+		}
+		signers = append(signers, signer)
+	}
+	return signers, strings.Join(notes, "; ")
 }
 
 // hostKeyCallback pins the expected key when provided, else accepts the first key

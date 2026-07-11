@@ -23,15 +23,18 @@
 //     mailnite->relay = mailnite's reply bytes). Each value on the wire is a
 //     value.Raw byte chunk.
 //
-// Control messages (session/conn arguments and session events) are small JSON
-// documents carried in a value.String, so the contract is human-readable and
-// versionable; only the high-rate conn byte path uses value.Raw directly.
+// Everything on the wire is a NATIVE value message — control documents
+// (session/conn arguments, session events) are value maps marshaled straight
+// from the tagged structs below (value.Marshal / value.Unmarshal, the same
+// mechanics the rest of the stack persists with), and the high-rate conn byte
+// path is untagged value.Raw chunks. One msgpack encoding end to end: no JSON,
+// no base64, no second serializer inside the first. Codec[T] exposes the same
+// mapping as a valuerpc.Codec for typed helpers.
 package protocol
 
 import (
-	"encoding/json"
-
 	"go.arpabet.com/value"
+	"go.arpabet.com/value-rpc/valuerpc"
 	"golang.org/x/xerrors"
 )
 
@@ -44,8 +47,9 @@ const (
 
 // Version is the protocol revision mailnite announces in SessionRequest; the
 // relay rejects a mismatch so an old client meets a clear error, not a silent
-// wire break.
-const Version = "1"
+// wire break. Revision 2 switched the control messages from JSON-in-a-string
+// to native value maps.
+const Version = "2"
 
 // Transport names selectable at both ends — the CARRIER the tunnel rides:
 // plain TCP, QUIC, or WebSocket. All three run under TLS (that's why "tls" is
@@ -78,16 +82,16 @@ func NormalizeTransport(s string) string {
 // to mailnite. Proto is "tcp" (the only mail/web transport that needs binding);
 // it is carried explicitly so udp/other can be added without a wire change.
 type PortSpec struct {
-	Name  string `json:"name"`  // logical id: smtp, submission, imaps, pop3s, http, https
-	Port  int    `json:"port"`  // public TCP port on the VDS, e.g. 25, 465, 993, 443
-	Proto string `json:"proto"` // "tcp"
+	Name  string `value:"name,omitempty"`  // logical id: smtp, submission, imaps, pop3s, http, https
+	Port  int    `value:"port,omitempty"`  // public TCP port on the VDS, e.g. 25, 465, 993, 443
+	Proto string `value:"proto,omitempty"` // "tcp"
 }
 
 // SessionRequest is the argument of the session chat.
 type SessionRequest struct {
-	Version string     `json:"version"`
-	Token   string     `json:"token,omitempty"` // handshake token echo (ws); ignored under mTLS
-	Binds   []PortSpec `json:"binds"`
+	Version string     `value:"version,omitempty"`
+	Token   string     `value:"token,omitempty"` // handshake token echo (ws); ignored under mTLS
+	Binds   []PortSpec `value:"binds,omitempty"`
 }
 
 // Event types streamed back on the session chat.
@@ -99,27 +103,27 @@ const (
 
 // BindResult reports the outcome of one PortSpec.
 type BindResult struct {
-	Name       string `json:"name"`
-	Port       int    `json:"port"`
-	OK         bool   `json:"ok"`
-	PublicAddr string `json:"publicAddr,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Name       string `value:"name,omitempty"`
+	Port       int    `value:"port,omitempty"`
+	OK         bool   `value:"ok,omitempty"`
+	PublicAddr string `value:"publicAddr,omitempty"`
+	Error      string `value:"error,omitempty"`
 	// Privileged is set when a sub-1024 bind failed for lack of capability, so the
 	// onboarding UI can surface the setcap / sysctl remedy instead of a raw errno.
-	Privileged bool `json:"privileged,omitempty"`
+	Privileged bool `value:"privileged,omitempty"`
 }
 
 // Event is one message on the session stream. Only the fields relevant to Type
 // are populated.
 type Event struct {
-	Type       string       `json:"type"`
-	Binds      []BindResult `json:"binds,omitempty"`      // ready
-	ConnID     int64        `json:"connId,omitempty"`     // accept
-	Secret     string       `json:"secret,omitempty"`     // accept: capability for the conn chat
-	Name       string       `json:"name,omitempty"`       // accept: which bind
-	Port       int          `json:"port,omitempty"`       // accept
-	RemoteAddr string       `json:"remoteAddr,omitempty"` // accept: the public client
-	Message    string       `json:"message,omitempty"`    // error
+	Type       string       `value:"type,omitempty"`
+	Binds      []BindResult `value:"binds,omitempty"`      // ready
+	ConnID     int64        `value:"connId,omitempty"`     // accept
+	Secret     string       `value:"secret,omitempty"`     // accept: capability for the conn chat
+	Name       string       `value:"name,omitempty"`       // accept: which bind
+	Port       int          `value:"port,omitempty"`       // accept
+	RemoteAddr string       `value:"remoteAddr,omitempty"` // accept: the public client
+	Message    string       `value:"message,omitempty"`    // error
 }
 
 // ConnArgs is the argument of the conn chat: which accepted connection this chat
@@ -127,27 +131,44 @@ type Event struct {
 // accept event and only sent to the owning client's session stream — so on a
 // shared relay one client cannot attach to another client's connection.
 type ConnArgs struct {
-	ConnID int64  `json:"connId"`
-	Secret string `json:"secret"`
+	ConnID int64  `value:"connId,omitempty"`
+	Secret string `value:"secret,omitempty"`
 }
 
-// EncodeJSON packs any control document into a value.String for the wire.
-func EncodeJSON(v any) (value.Value, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	return value.Raw(b, false), nil
+// Encode marshals a control message (one of the tagged structs above) into the
+// native value map it travels as — a single msgpack encoding on the wire.
+func Encode(v any) (value.Value, error) {
+	return value.Marshal(v)
 }
 
-// DecodeJSON unpacks a control document previously produced by EncodeJSON. It
-// accepts either a value.String (the normal case) so callers can pass the raw
-// handler argument straight through.
-func DecodeJSON(val value.Value, out any) error {
-	if val == nil || val.Kind() != value.STRING {
-		return xerrors.Errorf("expected a JSON string argument, got %v", kindOf(val))
+// Decode unmarshals a control message previously produced by Encode, verifying
+// it is a value map before field mapping so a foreign payload (e.g. a protocol-1
+// JSON string) fails with a precise error instead of a zero-value struct.
+func Decode(val value.Value, out any) error {
+	if val == nil || val.Kind() != value.MAP {
+		return xerrors.Errorf("expected a value map, got %v (peer speaking protocol %s?)", kindOf(val), Version)
 	}
-	return json.Unmarshal(val.(value.String).Raw(), out)
+	return value.Unmarshal(val, out)
+}
+
+// Codec exposes the Encode/Decode mapping as a valuerpc.Codec, so control
+// messages plug into value-rpc's typed helpers (valueserver.AddUnary,
+// valueclient.CallUnary, …) exactly like any other typed message.
+func Codec[T any]() valuerpc.Codec[T] {
+	return valuerpc.Codec[T]{
+		Encode: func(v T) value.Value {
+			val, err := value.Marshal(&v)
+			if err != nil {
+				return value.Null
+			}
+			return val
+		},
+		Decode: func(v value.Value) (T, error) {
+			var out T
+			err := Decode(v, &out)
+			return out, err
+		},
+	}
 }
 
 func kindOf(val value.Value) value.Kind {

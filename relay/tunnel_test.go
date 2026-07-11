@@ -210,7 +210,7 @@ func TestTunnelConnSecretRejected(t *testing.T) {
 	defer cli.Close()
 
 	// A conn chat with a bogus id/secret must be refused (no such authorized conn).
-	args, _ := protocol.EncodeJSON(protocol.ConnArgs{ConnID: 999999, Secret: "bogus"})
+	args, _ := protocol.Encode(protocol.ConnArgs{ConnID: 999999, Secret: "bogus"})
 	put := make(chan value.Value)
 	readC, _, err := cli.Chat(context.Background(), protocol.FnConn, args, 1, put)
 	if err != nil {

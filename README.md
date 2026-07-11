@@ -150,6 +150,14 @@ mailrelay gen-ssh-key  generate the SSH keypair used to deploy
 mailrelay deploy       ship the relay to a VDS over SSH and start it
 ```
 
+`deploy` authenticates to the VDS by **public key** by preference: it tries an
+explicit `--ssh-key` (passphrase-protected keys are supported via
+`--ssh-key-passphrase`), then a running **ssh-agent** (`SSH_AUTH_SOCK`), then
+the default `~/.ssh/id_ed25519` / `id_ecdsa` / `id_rsa` — so `mailrelay deploy
+--host relay.example.com` just works with your existing key setup, no password.
+`--password` remains as a fallback (and supplies `sudo` when `--user` isn't
+root); `--no-agent` / `--no-default-keys` narrow the search when you need to.
+
 See [DESIGN.md](DESIGN.md) for the architecture, the security model, and how the
 `relayclient` listener drops into mailnite's existing server factories.
 
