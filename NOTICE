@@ -1,0 +1,7 @@
+mailrelay
+Copyright 2022-present Mailnite LLC
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It builds on the arpabet libraries — value-rpc, servion and cligo
+(https://go.arpabet.com) — which are distributed under their own licenses.

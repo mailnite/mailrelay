@@ -1,0 +1,17 @@
+# Build output
+/mailrelay
+/dist/
+
+# Generated tunnel material (never commit CA keys / certs / tokens / ssh keys)
+/relay-pki/
+*.pem
+*.crt
+*.key
+token
+id_ed25519
+id_ed25519.pub
+
+# Go test / profiling artifacts
+*.test
+*.out
+*.prof
