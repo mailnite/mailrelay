@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -270,6 +271,26 @@ func (s *Session) openConn(ctx context.Context, connID int64, secret, remoteAddr
 		return nil, err
 	}
 	return protocol.NewChanConn(put, readC, protocol.Addr{Net: "tcp", Str: remoteAddr}), nil
+}
+
+// DialOut opens an outbound connection to host:port THROUGH the relay: the
+// relay connects from the VDS and this returns a net.Conn carrying that
+// connection's bytes. It is the egress counterpart of the reverse listeners —
+// for a mailnite whose own ISP blocks outbound SMTP, the queue dials its
+// external MX hosts through here so mail leaves from the relay's clean public
+// IP. The relay restricts the port to mail ports. Independent of Bind: a
+// session can dial out without binding any public port.
+func (s *Session) DialOut(ctx context.Context, host string, port int) (net.Conn, error) {
+	put := make(chan value.Value, 16)
+	args, err := protocol.Encode(protocol.DialArgs{Host: host, Port: port})
+	if err != nil {
+		return nil, err
+	}
+	readC, _, err := s.cli.Chat(ctx, protocol.FnDial, args, 16, put)
+	if err != nil {
+		return nil, xerrors.Errorf("open dial to %s:%d: %w", host, port, err)
+	}
+	return protocol.NewChanConn(put, readC, protocol.Addr{Net: "tcp", Str: net.JoinHostPort(host, strconv.Itoa(port))}), nil
 }
 
 // Ping verifies the relay is reachable and answering.

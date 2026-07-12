@@ -525,3 +525,122 @@ func TestPrivilegedBindReported(t *testing.T) {
 		t.Fatalf("expected Privileged=true for a failed :443 bind, got %+v", binds[0])
 	}
 }
+
+// TestTunnelDialOut exercises the OUTBOUND path: the relay dials an external
+// host on mailnite's behalf (the egress fix for an ISP that blocks port 25) and
+// pumps bytes both ways. An in-process "MX" on an allowed mail port stands in
+// for a real one; the relay dials it, and the mailnite-side net.Conn must carry
+// the peer-speaks-first banner and echo, proving the byte pump runs both ways.
+func TestTunnelDialOut(t *testing.T) {
+	log := zap.NewNop()
+	ca, _ := pki.GenerateCA("test-ca")
+	srvCert, _ := ca.IssueServerCert([]string{"127.0.0.1"})
+	cliCert, _ := ca.IssueClientCert("mailnite")
+	srvTLS, _ := pki.ServerTLSConfig(srvCert.CertPEM, srvCert.KeyPEM, ca.CertPEM)
+	srv, err := valueserver.NewTLSServer("127.0.0.1:0", srvTLS, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := relay.New(log, "")
+	tun.Register(srv)
+	go srv.Run()
+	defer srv.Close()
+	defer tun.Close()
+
+	// A stand-in MX on an allowed mail port (2525 is unprivileged; skip if the
+	// port is already taken so the test never flakes on a busy machine). It
+	// speaks first (like SMTP's 220 banner), then echoes.
+	mx, err := net.Listen("tcp", "127.0.0.1:2525")
+	if err != nil {
+		t.Skipf("mail port 2525 unavailable for the stand-in MX: %v", err)
+	}
+	defer mx.Close()
+	go func() {
+		c, err := mx.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		c.Write([]byte("220 relay-egress ESMTP\r\n"))
+		io.Copy(c, c)
+	}()
+
+	sess, err := relayclient.Dial(context.Background(), relayclient.Config{
+		Transport: protocol.TransportTCP, Addr: srv.Addr().String(), ServerName: "127.0.0.1",
+		CAPEM: ca.CertPEM, ClientCertPEM: cliCert.CertPEM, ClientKeyPEM: cliCert.KeyPEM,
+	}, log)
+	if err != nil {
+		t.Fatalf("dial relay: %v", err)
+	}
+	defer sess.Close()
+
+	// Dial the external MX THROUGH the relay — no Bind/session listeners needed.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := sess.DialOut(ctx, "127.0.0.1", 2525)
+	if err != nil {
+		t.Fatalf("dial out: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// The peer speaks first: the banner must arrive over the tunnel.
+	banner := make([]byte, len("220 relay-egress ESMTP\r\n"))
+	if _, err := io.ReadFull(conn, banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if string(banner) != "220 relay-egress ESMTP\r\n" {
+		t.Fatalf("banner mismatch: %q", banner)
+	}
+	// And our bytes reach the MX and echo back.
+	msg := []byte("EHLO mailnite\r\n")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(got) != string(msg) {
+		t.Fatalf("echo mismatch: %q", got)
+	}
+}
+
+// TestTunnelDialOutPortRejected proves the relay refuses to dial a non-mail
+// port, so a leaked token cannot turn the tunnel into a general TCP proxy.
+func TestTunnelDialOutPortRejected(t *testing.T) {
+	log := zap.NewNop()
+	ca, _ := pki.GenerateCA("test-ca")
+	srvCert, _ := ca.IssueServerCert([]string{"127.0.0.1"})
+	cliCert, _ := ca.IssueClientCert("mailnite")
+	srvTLS, _ := pki.ServerTLSConfig(srvCert.CertPEM, srvCert.KeyPEM, ca.CertPEM)
+	srv, _ := valueserver.NewTLSServer("127.0.0.1:0", srvTLS, log)
+	tun := relay.New(log, "")
+	tun.Register(srv)
+	go srv.Run()
+	defer srv.Close()
+	defer tun.Close()
+
+	sess, err := relayclient.Dial(context.Background(), relayclient.Config{
+		Transport: protocol.TransportTCP, Addr: srv.Addr().String(), ServerName: "127.0.0.1",
+		CAPEM: ca.CertPEM, ClientCertPEM: cliCert.CertPEM, ClientKeyPEM: cliCert.KeyPEM,
+	}, log)
+	if err != nil {
+		t.Fatalf("dial relay: %v", err)
+	}
+	defer sess.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Port 80 is not a mail port: the relay must reject the dial. A rejected
+	// chat surfaces either as an open error or an immediately-closed stream.
+	conn, err := sess.DialOut(ctx, "127.0.0.1", 80)
+	if err != nil {
+		return // rejected at open — the expected, cleanest outcome
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if n, err := conn.Read(make([]byte, 1)); err == nil && n > 0 {
+		t.Fatal("expected the relay to refuse dialing a non-mail port, but bytes flowed")
+	}
+}

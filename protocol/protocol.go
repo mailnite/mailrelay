@@ -45,7 +45,35 @@ const (
 	FnConn    = "conn"
 	FnProbe   = "probe"
 	FnInfo    = "info"
+	// FnDial is the OUTBOUND counterpart of FnConn: mailnite opens a dial chat
+	// naming an external host:port, the relay connects to it FROM THE VDS, and
+	// the two chat directions carry that connection's bytes. It lets a mailnite
+	// behind an ISP that blocks outbound 25 deliver mail through the relay's
+	// clean egress and public IP — the same tunnel, the opposite direction.
+	FnDial = "dial"
 )
+
+// DialArgs is the argument of a dial chat: the external host and TCP port the
+// relay should connect to on mailnite's behalf. The relay restricts the port to
+// known mail ports (see DialPortAllowed) so the tunnel is an outbound MAIL path,
+// not a general-purpose open proxy that could be abused for arbitrary TCP.
+type DialArgs struct {
+	Host string `value:"host,omitempty"`
+	Port int    `value:"port,omitempty"`
+}
+
+// DialPortAllowed reports whether a port may be an outbound dial target. Only
+// the SMTP delivery and submission ports are permitted — direct MX delivery
+// (25) and relaying through a smarthost (465/587), plus their dev-mode
+// counterparts — so a leaked token cannot turn the relay into a TCP proxy.
+func DialPortAllowed(port int) bool {
+	switch port {
+	case 25, 465, 587, 2525, 2465, 2587:
+		return true
+	default:
+		return false
+	}
+}
 
 // RelayInfo is the relay's self-report: the version and build of the mailrelay
 // binary actually running on the VDS. mailnite has no other way to know it — the

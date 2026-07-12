@@ -42,6 +42,10 @@ import (
 // stalled handshake can't pin a file descriptor forever.
 const connClaimTimeout = 15 * time.Second
 
+// dialOutTimeout bounds the relay's connect to an external mail host for an
+// outbound dial chat, so a blackholed MX can't pin the goroutine indefinitely.
+const dialOutTimeout = 30 * time.Second
+
 // Tunnel is the relay's value-rpc service, shared by every connected client.
 type Tunnel struct {
 	log     *zap.Logger
@@ -97,7 +101,10 @@ func (t *Tunnel) Register(r valuerpc.Registrar) error {
 	if err := r.AddChat(protocol.FnSession, valuerpc.Any, t.session); err != nil {
 		return err
 	}
-	return r.AddChat(protocol.FnConn, valuerpc.Any, t.conn)
+	if err := r.AddChat(protocol.FnConn, valuerpc.Any, t.conn); err != nil {
+		return err
+	}
+	return r.AddChat(protocol.FnDial, valuerpc.Any, t.dialOut)
 }
 
 func (t *Tunnel) ping(_ context.Context, _ value.Value) (value.Value, error) {
@@ -320,6 +327,77 @@ func (t *Tunnel) conn(ctx context.Context, args value.Value, inC <-chan value.Va
 				continue
 			}
 			if _, err := pc.Write(v.(value.String).Raw()); err != nil {
+				return
+			}
+		}
+	}()
+
+	return outC, nil
+}
+
+// dialOut is the OUTBOUND byte pump — FnConn in reverse. The client names an
+// external host:port; the relay connects to it from the VDS and shuttles bytes
+// both ways until either side closes. The session's transport (mTLS or token)
+// already authenticated the client, and the port is restricted to mail ports,
+// so this is an outbound MAIL path, not an open TCP proxy. The dialed peer
+// speaks first on SMTP (the 220 banner), which the relay->client direction
+// forwards as soon as it arrives — symmetric with an inbound conn.
+func (t *Tunnel) dialOut(ctx context.Context, args value.Value, inC <-chan value.Value) (<-chan value.Value, error) {
+	var da protocol.DialArgs
+	if err := protocol.Decode(args, &da); err != nil {
+		return nil, xerrors.Errorf("dial args: %w", err)
+	}
+	if da.Host == "" {
+		return nil, xerrors.New("dial: no host")
+	}
+	if !protocol.DialPortAllowed(da.Port) {
+		return nil, xerrors.Errorf("dial: port %d not permitted (mail ports only)", da.Port)
+	}
+
+	addr := net.JoinHostPort(da.Host, strconv.Itoa(da.Port))
+	d := net.Dialer{Timeout: dialOutTimeout}
+	remote, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		t.log.Info("RelayDialFailed", zap.String("addr", addr), zap.Error(err))
+		return nil, xerrors.Errorf("dial %s: %w", addr, err)
+	}
+	t.log.Info("RelayDialOut", zap.String("addr", addr), zap.String("via", remote.LocalAddr().String()))
+
+	outC := make(chan value.Value, 16)
+	var once sync.Once
+	closeConn := func() { once.Do(func() { remote.Close() }) }
+
+	// relay -> client: bytes from the external host (SMTP banner, replies).
+	go func() {
+		defer close(outC)
+		defer closeConn()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := remote.Read(buf)
+			if n > 0 {
+				b := make([]byte, n)
+				copy(b, buf[:n])
+				select {
+				case outC <- value.Raw(b, false):
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// client -> relay: mailnite's bytes to send to the external host. inC
+	// closing means mailnite closed its end of the connection.
+	go func() {
+		defer closeConn()
+		for v := range inC {
+			if v == nil || v.Kind() != value.STRING {
+				continue
+			}
+			if _, err := remote.Write(v.(value.String).Raw()); err != nil {
 				return
 			}
 		}
