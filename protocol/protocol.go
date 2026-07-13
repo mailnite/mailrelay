@@ -62,13 +62,18 @@ type DialArgs struct {
 	Port int    `value:"port,omitempty"`
 }
 
-// DialPortAllowed reports whether a port may be an outbound dial target. Only
-// the SMTP delivery and submission ports are permitted — direct MX delivery
-// (25) and relaying through a smarthost (465/587), plus their dev-mode
-// counterparts — so a leaked token cannot turn the relay into a TCP proxy.
+// DialPortAllowed reports whether a port may be an outbound dial target. The
+// SMTP delivery and submission ports (direct MX delivery on 25, relaying through
+// a smarthost on 465/587, plus their dev-mode counterparts) support outbound
+// mail; HTTP/HTTPS (80/443) support mailnite fetching remote email images
+// through the relay's clean egress, so a reader's browser never contacts a
+// tracker directly. Everything else is refused, so a leaked token cannot turn
+// the relay into a general-purpose TCP proxy.
 func DialPortAllowed(port int) bool {
 	switch port {
-	case 25, 465, 587, 2525, 2465, 2587:
+	case 25, 465, 587, 2525, 2465, 2587: // outbound mail
+		return true
+	case 80, 443, 8080, 8443: // remote email-image fetch (mailnite does the HTTP itself)
 		return true
 	default:
 		return false
@@ -85,6 +90,10 @@ func DialPortAllowed(port int) bool {
 type RelayInfo struct {
 	Version string `value:"version,omitempty"`
 	Build   string `value:"build,omitempty"`
+	// Timezone is the VDS's local timezone (IANA name, else a fixed UTC offset).
+	// mailnite reads it so its relay-egress persona stays consistent with the
+	// relay's geolocation. An older relay leaves it empty.
+	Timezone string `value:"timezone,omitempty"`
 }
 
 // ProbeRequest asks the relay whether it can bind each public port on the VDS.

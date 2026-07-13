@@ -117,3 +117,19 @@ func TestCodecTyped(t *testing.T) {
 		t.Fatalf("codec round-trip mismatch: %+v", out)
 	}
 }
+
+// TestDialPortAllowed locks the outbound port allowlist: mail ports plus the
+// HTTP(S) ports the remote-image proxy fetches over — and nothing else, so the
+// relay never becomes a general TCP proxy.
+func TestDialPortAllowed(t *testing.T) {
+	for _, p := range []int{25, 465, 587, 2525, 2465, 2587, 80, 443, 8080, 8443} {
+		if !DialPortAllowed(p) {
+			t.Errorf("DialPortAllowed(%d) = false, want true", p)
+		}
+	}
+	for _, p := range []int{22, 3306, 6379, 8443 + 1, 1, 65535, 0, 8081} {
+		if DialPortAllowed(p) {
+			t.Errorf("DialPortAllowed(%d) = true, want false (not an allowed egress port)", p)
+		}
+	}
+}

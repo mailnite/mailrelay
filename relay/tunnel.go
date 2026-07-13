@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -111,10 +112,25 @@ func (t *Tunnel) ping(_ context.Context, _ value.Value) (value.Value, error) {
 	return value.Utf8("pong"), nil
 }
 
-// info returns this relay binary's version and build, so a connected mailnite
-// can show which relay it is tunnelling through alongside its own version.
+// info returns this relay binary's version and build (so a connected mailnite
+// can show which relay it is tunnelling through) plus the VDS's local timezone
+// (so mailnite's relay-egress persona stays geo-consistent).
 func (t *Tunnel) info(_ context.Context, _ value.Value) (value.Value, error) {
-	return protocol.Encode(protocol.RelayInfo{Version: t.version, Build: t.build})
+	return protocol.Encode(protocol.RelayInfo{Version: t.version, Build: t.build, Timezone: localTimezone()})
+}
+
+// localTimezone reports the VDS's timezone: the IANA name when the host is
+// configured with one (the usual case), else a fixed "UTC±hh:mm" offset.
+func localTimezone() string {
+	if name := time.Local.String(); name != "" && name != "Local" {
+		return name
+	}
+	_, offset := time.Now().Zone()
+	sign := '+'
+	if offset < 0 {
+		sign, offset = '-', -offset
+	}
+	return fmt.Sprintf("UTC%c%02d:%02d", sign, offset/3600, (offset%3600)/60)
 }
 
 // probe is a unary bindability check: for each requested port it binds and
