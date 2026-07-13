@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-present Mailnite LLC.
+ * Copyright 2022-present Karagatan LLC.
  * SPDX-License-Identifier: Apache-2.0
  */
 

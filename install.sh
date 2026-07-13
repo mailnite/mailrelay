@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Copyright 2022-present Mailnite LLC.
+# Copyright 2022-present Karagatan LLC.
 # SPDX-License-Identifier: Apache-2.0
 #
 # mailrelay installer — served at https://get.mailnite.com/relay

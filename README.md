@@ -112,9 +112,22 @@ That downloads the right binary, verifies its sha256 against the channel
 manifest, installs a hardened systemd service that may bind ports below 1024
 (via `AmbientCapabilities`, which — unlike `setcap` — survives binary updates),
 starts it in key-authenticated mode, and enables a daily self-update timer.
-It ends by printing the relay address to paste back into the console. The same
-script also updates (`--update`), pins versions (`--version vX.Y.Z`) and
-uninstalls (`--uninstall`); see [install.sh](install.sh).
+It ends by printing the relay address to paste back into the console.
+
+Updates land on their own via that daily timer, but to pull the latest release
+now — on the VDS:
+
+```bash
+# re-run the installer in update mode (upgrades only if the channel moved,
+# keeping the existing key/transport/bind), then restarts the service:
+curl -fsSL https://get.mailnite.com/relay | sudo bash -s -- --update
+
+# …or trigger the built-in updater immediately without re-fetching the script:
+sudo systemctl start mailrelay-update.service
+```
+
+The same installer also pins versions (`--version vX.Y.Z`) and uninstalls
+(`--uninstall`); see [install.sh](install.sh).
 
 Prefer to drive it from your workstation over SSH, with mutual TLS instead of
 the shared key? From this repo:
@@ -187,5 +200,5 @@ project's Apache-2.0 license.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). Copyright
-2022-present Mailnite LLC. It builds on the arpabet libraries (value-rpc,
+2022-present Karagatan LLC. It builds on the arpabet libraries (value-rpc,
 servion, cligo) under their own licenses; see [NOTICE](NOTICE).

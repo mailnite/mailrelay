@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Copyright 2022-present Mailnite LLC.
+# Copyright 2022-present Karagatan LLC.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Behavioral test for install.sh: drives the REAL installer through
