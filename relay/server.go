@@ -86,6 +86,13 @@ func NewServer() *Server { return &Server{} }
 // The listening socket is not bound here — bind errors belong to Serve, where
 // the command reports them as command failures rather than wiring failures.
 func (t *Server) PostConstruct() error {
+	// Tighten dead-peer detection on the control connections: a session holds
+	// this VDS's public mail ports, and the OS-default keepalive cadence leaves
+	// a half-open zombie (slept laptop, hard crash) squatting them for minutes.
+	// 10s probes cut the worst case; heartbeats and takeover (tunnel.go) are
+	// the primary recovery — this is the transport-level backstop.
+	valueserver.KeepAlivePeriod = 10 * time.Second
+
 	cfg, err := t.Source.RelayConfig()
 	if err != nil {
 		return err

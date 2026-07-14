@@ -168,6 +168,13 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 		Version: protocol.Version,
 		Token:   s.cfg.Token,
 		Binds:   specs,
+		// Reclaim ports a previous session of this client left bound (the
+		// zombie after a slept laptop / hard crash): the successor is the
+		// truth, and every authenticated client may bind anything anyway.
+		Takeover: true,
+		// Promise beats so the relay reaps THIS session promptly if we vanish
+		// without a successor (see heartbeat below).
+		HeartbeatSec: int(heartbeatInterval / time.Second),
 	})
 	if err != nil {
 		unbind()
@@ -212,7 +219,42 @@ func (s *Session) Bind(ctx context.Context, specs []protocol.PortSpec) (map[stri
 		defer close(done) // the relay closed the event stream: teardown acknowledged
 		s.pump(chatCtx, events)
 	}()
+	// From here the heartbeat goroutine OWNS ctl (it is the only sender and the
+	// one that closes it) — Close() signals via cancel and must not close ctl
+	// itself, or a beat in flight would panic on a closed channel.
+	go s.heartbeat(chatCtx, ctl, done)
 	return out, ready.Binds, nil
+}
+
+// heartbeatInterval paces the proof-of-life beats on the session chat. The
+// relay reaps a session silent for ~3 intervals, so a vanished client stops
+// squatting the public ports in about a minute instead of whenever TCP
+// keepalive notices.
+const heartbeatInterval = 20 * time.Second
+
+// heartbeat sends a beat on the session control channel until the session ends
+// (context cancelled, or the relay closed the event stream). It closes ctl on
+// the way out — the half-close that tells the relay this side is done.
+func (s *Session) heartbeat(ctx context.Context, ctl chan<- value.Value, done <-chan struct{}) {
+	defer close(ctl)
+	tick := time.NewTicker(heartbeatInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-tick.C:
+			select {
+			case ctl <- value.Utf8(protocol.Heartbeat):
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
+	}
 }
 
 // pump routes accept events into per-listener queues, opening a conn chat (the
@@ -348,15 +390,15 @@ func (s *Session) Close() error {
 	s.once.Do(func() {
 		s.mu.Lock()
 		s.closed = true
-		ctl, cancel, done := s.ctl, s.cancel, s.pumpDone
+		cancel, done := s.cancel, s.pumpDone
 		s.ctl, s.cancel = nil, nil
 		s.mu.Unlock()
 		if cancel != nil {
 			cancel() // relay watches this cancellation to release the ports
 		}
-		if ctl != nil {
-			close(ctl) // half-close: the relay's second teardown trigger
-		}
+		// The half-close of the control channel (the relay's second teardown
+		// trigger) is delivered by the heartbeat goroutine's exit — it owns ctl,
+		// and closing it here as well would race a beat in flight.
 		if done != nil {
 			select {
 			case <-done: // relay closed the session stream — ports are released

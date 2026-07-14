@@ -160,11 +160,32 @@ type PortSpec struct {
 }
 
 // SessionRequest is the argument of the session chat.
+//
+// Takeover and HeartbeatSec are protocol-compatible extensions (value maps
+// ignore unknown fields): an old relay ignores them, an old client omits them
+// and gets the pre-extension behavior.
 type SessionRequest struct {
 	Version string     `value:"version,omitempty"`
 	Token   string     `value:"token,omitempty"` // handshake token echo (ws); ignored under mTLS
 	Binds   []PortSpec `value:"binds,omitempty"`
+	// Takeover lets this session evict a previous session of the SAME relay
+	// that still holds a requested port — the zombie a client leaves behind
+	// when its host sleeps or crashes mid-connection. The successor is the
+	// truth: every authenticated client is already trusted to bind anything,
+	// so reclaiming beats waiting minutes for TCP keepalive to notice.
+	Takeover bool `value:"takeover,omitempty"`
+	// HeartbeatSec declares the client's beat interval on the session chat's
+	// inbound channel. A session that PROMISED beats and then goes silent for
+	// ~3 intervals is reaped (its public ports released); 0 = no promise, no
+	// reaping (old clients).
+	HeartbeatSec int `value:"heartbeatSec,omitempty"`
 }
+
+// Heartbeat is the value a client sends periodically on the session chat's
+// inbound channel when it declared HeartbeatSec — proof of life the relay
+// uses to reap dead sessions. The relay treats ANY inbound value as a beat;
+// the constant just names the conventional payload.
+const Heartbeat = "hb"
 
 // Event types streamed back on the session chat.
 const (

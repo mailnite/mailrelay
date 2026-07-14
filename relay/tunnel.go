@@ -192,6 +192,25 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 	}
 	s.outC <- ready // buffered; the first thing the client reads
 
+	// A session that promised heartbeats is reaped after ~3 silent intervals:
+	// its client is gone (slept laptop, hard crash) and its listeners must not
+	// squat the public ports until TCP keepalive notices minutes later. Armed
+	// BEFORE the session is published so a concurrent takeover shutdown always
+	// sees a settled field.
+	if req.HeartbeatSec > 0 {
+		hb := req.HeartbeatSec
+		if hb > 300 {
+			hb = 300
+		}
+		window := time.Duration(hb) * 3 * time.Second
+		s.hbTimer = time.AfterFunc(window, func() {
+			t.log.Warn("RelaySessionExpired",
+				zap.Int("heartbeatSec", hb), zap.Duration("silentFor", window))
+			s.shutdown()
+		})
+		s.hbWindow = window
+	}
+
 	// Reserve the accept loops' WaitGroup slots before the session is published,
 	// so a shutdown that races the loop startup still waits for every loop
 	// before closing outC.
@@ -211,9 +230,12 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 
 	// Two teardown triggers: the client cancels/streams-out (ctx) or half-closes
 	// its send side (inC drains to close). Either ends the session exactly once.
+	// Every inbound value counts as a heartbeat (protocol.Heartbeat by convention).
 	go func() {
 		for range inC {
-			// control channel: reserved for future heartbeats; drain to detect close.
+			if s.hbTimer != nil {
+				s.hbTimer.Reset(s.hbWindow)
+			}
 		}
 		s.shutdown()
 	}()
@@ -222,7 +244,8 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 		s.shutdown()
 	}()
 
-	t.log.Info("RelaySessionOpen", zap.Int("binds", len(results)), zap.Int("sessions", t.sessionCount()))
+	t.log.Info("RelaySessionOpen", zap.Int("binds", len(results)), zap.Int("sessions", t.sessionCount()),
+		zap.Bool("takeover", req.Takeover), zap.Int("heartbeatSec", req.HeartbeatSec))
 	return s.outC, nil
 }
 
@@ -235,15 +258,28 @@ type boundPort struct {
 
 // openListeners opens a public listener per PortSpec (no accept loops yet) and
 // records each on the session for teardown. A port another client already holds
-// fails with EADDRINUSE (reported, not fatal); a sub-1024 permission failure is
-// reported with Privileged=true so onboarding can show the setcap / sysctl remedy
-// rather than a bare errno.
+// fails with EADDRINUSE (reported, not fatal) — unless the request carries
+// Takeover, in which case a port held by ANOTHER RELAY SESSION evicts that
+// session and the bind is retried once (the reconnect-after-sleep path: the
+// successor reclaims its own zombie's ports instead of waiting minutes for TCP
+// keepalive). A port held by a foreign process still fails honestly — evicting
+// sessions can never free it. A sub-1024 permission failure is reported with
+// Privileged=true so onboarding can show the setcap / sysctl remedy rather
+// than a bare errno.
 func (t *Tunnel) openListeners(req *protocol.SessionRequest, s *session) ([]protocol.BindResult, []boundPort) {
 	results := make([]protocol.BindResult, 0, len(req.Binds))
 	var bound []boundPort
 	for _, spec := range req.Binds {
 		res := protocol.BindResult{Name: spec.Name, Port: spec.Port}
 		ln, err := net.Listen("tcp", ":"+strconv.Itoa(spec.Port))
+		if err != nil && req.Takeover && spec.Port > 0 {
+			if victim := t.portOwner(spec.Port, s); victim != nil {
+				t.log.Info("RelayTakeover", zap.String("name", spec.Name), zap.Int("port", spec.Port),
+					zap.String("reason", "port held by a previous session; the successor evicts it"))
+				victim.shutdown() // synchronous: listeners closed, accept loops drained
+				ln, err = net.Listen("tcp", ":"+strconv.Itoa(spec.Port))
+			}
+		}
 		if err != nil {
 			res.Error = err.Error()
 			if spec.Port < 1024 && errors.Is(err, syscall.EACCES) {
@@ -261,6 +297,26 @@ func (t *Tunnel) openListeners(req *protocol.SessionRequest, s *session) ([]prot
 		results = append(results, res)
 	}
 	return results, bound
+}
+
+// portOwner returns the published session (never `except`) holding a listener
+// on the given public port, or nil when no session owns it (the port belongs
+// to a foreign process, or to nobody). A session's listeners slice is written
+// only before publication, so reading it under t.mu is race-free.
+func (t *Tunnel) portOwner(port int, except *session) *session {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for s2 := range t.sessions {
+		if s2 == except {
+			continue
+		}
+		for _, ln := range s2.listeners {
+			if a, ok := ln.Addr().(*net.TCPAddr); ok && a.Port == port {
+				return s2
+			}
+		}
+	}
+	return nil
 }
 
 // acceptLoop accepts public connections on one bound port, stashes each with a
@@ -516,6 +572,11 @@ type session struct {
 	listeners []net.Listener
 	once      sync.Once
 	onClose   func() // called once on shutdown (deregisters the session)
+	// Heartbeat reaping (set before publication when the client declared
+	// HeartbeatSec): the timer fires shutdown after hbWindow of silence and is
+	// re-armed by every inbound value on the session chat.
+	hbTimer  *time.Timer
+	hbWindow time.Duration
 }
 
 // shutdown stops accepting, closes this session's listeners, waits for its accept
@@ -523,6 +584,9 @@ type session struct {
 // and deregisters the session.
 func (s *session) shutdown() {
 	s.once.Do(func() {
+		if s.hbTimer != nil {
+			s.hbTimer.Stop()
+		}
 		close(s.stop)
 		for _, ln := range s.listeners {
 			_ = ln.Close()

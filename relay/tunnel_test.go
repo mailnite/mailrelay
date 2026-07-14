@@ -644,3 +644,235 @@ func TestTunnelDialOutPortRejected(t *testing.T) {
 		t.Fatal("expected the relay to refuse dialing a non-mail port, but bytes flowed")
 	}
 }
+
+// freeTCPPort reserves an ephemeral port and releases it, so a test can hand a
+// concrete port number to two competing sessions. The tiny reuse race is fine
+// on loopback in tests.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// relayHarness stands up a mutual-TLS relay and returns a dialer for clients —
+// the shared setup of the takeover/heartbeat tests.
+func relayHarness(t *testing.T) (dial func() *relayclient.Session, addr string, ca *pki.CA, cleanup func()) {
+	t.Helper()
+	log := zap.NewNop()
+	ca, _ = pki.GenerateCA("test-ca")
+	srvCert, _ := ca.IssueServerCert([]string{"127.0.0.1"})
+	cliCert, _ := ca.IssueClientCert("mailnite")
+	srvTLS, _ := pki.ServerTLSConfig(srvCert.CertPEM, srvCert.KeyPEM, ca.CertPEM)
+	srv, err := valueserver.NewTLSServer("127.0.0.1:0", srvTLS, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := relay.New(log, "")
+	tun.Register(srv)
+	go srv.Run()
+	dial = func() *relayclient.Session {
+		s, err := relayclient.Dial(context.Background(), relayclient.Config{
+			Transport: protocol.TransportTCP, Addr: srv.Addr().String(), ServerName: "127.0.0.1",
+			CAPEM: ca.CertPEM, ClientCertPEM: cliCert.CertPEM, ClientKeyPEM: cliCert.KeyPEM,
+		}, log)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return s
+	}
+	return dial, srv.Addr().String(), ca, func() { srv.Close(); tun.Close() }
+}
+
+// TestTakeoverReclaimsPreviousSessionPort is the slept-laptop scenario: a
+// previous session still holds a public port (the relay has not noticed it is
+// dead), and the SAME client reconnects. The successor must evict the old
+// session and bind on the first try — not wait for keepalive to reap it.
+func TestTakeoverReclaimsPreviousSessionPort(t *testing.T) {
+	dial, _, _, cleanup := relayHarness(t)
+	defer cleanup()
+	port := freeTCPPort(t)
+	spec := []protocol.PortSpec{{Name: "svc", Port: port, Proto: "tcp"}}
+
+	a := dial()
+	defer a.Close()
+	la, ba, err := a.Bind(context.Background(), spec)
+	if err != nil || !ba[0].OK {
+		t.Fatalf("first session bind: %v %+v", err, ba)
+	}
+
+	// The successor (relayclient always requests takeover) reclaims the port.
+	b := dial()
+	defer b.Close()
+	lb, bb, err := b.Bind(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("successor bind: %v", err)
+	}
+	if !bb[0].OK {
+		t.Fatalf("successor did not take the port over: %+v", bb)
+	}
+	go serveEcho(lb["svc"])
+	echoOK(t, bb[0].PublicAddr, "hello-through-the-successor")
+
+	// The evicted session's reverse listener must die (its stream was closed).
+	dead := make(chan struct{})
+	go func() {
+		for {
+			if _, err := la["svc"].Accept(); err != nil {
+				close(dead)
+				return
+			}
+		}
+	}()
+	select {
+	case <-dead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("evicted session's listener still accepting after takeover")
+	}
+}
+
+// TestTakeoverNeverEvictsForForeignPorts: a port held by another PROCESS (not a
+// relay session) must still fail honestly — takeover can only reclaim what the
+// relay itself holds.
+func TestTakeoverNeverEvictsForForeignPorts(t *testing.T) {
+	dial, _, _, cleanup := relayHarness(t)
+	defer cleanup()
+
+	// Hold the WILDCARD address, like a real squatter (nginx on :443) — on BSD
+	// a specific-address holder would legally coexist with the relay's :port.
+	hold, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Close()
+	port := hold.Addr().(*net.TCPAddr).Port
+
+	s := dial()
+	defer s.Close()
+	_, binds, err := s.Bind(context.Background(), []protocol.PortSpec{{Name: "svc", Port: port, Proto: "tcp"}})
+	if err != nil {
+		t.Fatalf("bind call: %v", err)
+	}
+	if binds[0].OK {
+		t.Fatal("bind reported OK for a port held by a foreign process")
+	}
+	if binds[0].Error == "" {
+		t.Fatal("expected the foreign-holder bind error to be reported")
+	}
+	// The foreign holder must still own the port.
+	if c, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err == nil {
+		c.Close()
+	} else {
+		t.Fatalf("foreign holder lost its port: %v", err)
+	}
+}
+
+// TestHeartbeatReapsSilentSession: a session that PROMISES beats and then goes
+// silent is reaped after ~3 intervals — its public port is released without
+// waiting for the transport to notice the dead peer.
+func TestHeartbeatReapsSilentSession(t *testing.T) {
+	_, addr, ca, cleanup := relayHarness(t)
+	defer cleanup()
+	cliCert, _ := ca.IssueClientCert("mailnite-raw")
+	cliTLS, _ := pki.ClientTLSConfig(ca.CertPEM, cliCert.CertPEM, cliCert.KeyPEM, "127.0.0.1")
+	cli := valueclient.NewTLSClient(addr, cliTLS)
+	if err := cli.ConnectContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	port := freeTCPPort(t)
+	args, _ := protocol.Encode(protocol.SessionRequest{
+		Version:      protocol.Version,
+		Binds:        []protocol.PortSpec{{Name: "svc", Port: port, Proto: "tcp"}},
+		HeartbeatSec: 1, // promise beats every second — then send none
+	})
+	put := make(chan value.Value)
+	events, _, err := cli.Chat(context.Background(), protocol.FnSession, args, 16, put)
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
+	first, ok := <-events
+	if !ok {
+		t.Fatal("no ready event")
+	}
+	var ready protocol.Event
+	if err := protocol.Decode(first, &ready); err != nil || !ready.Binds[0].OK {
+		t.Fatalf("bind not ready: %v %+v", err, ready)
+	}
+
+	// Silence. The relay must end the session (stream closes) within ~3s+slack.
+	deadline := time.After(8 * time.Second)
+	for {
+		select {
+		case _, open := <-events:
+			if !open {
+				goto reaped
+			}
+		case <-deadline:
+			t.Fatal("silent session was not reaped")
+		}
+	}
+reaped:
+	// The public port must be free again.
+	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("port still held after reap: %v", err)
+	}
+	ln.Close()
+	close(put)
+}
+
+// TestHeartbeatKeepsSessionAlive: beats re-arm the reaper — a session beating
+// on schedule lives well past the silence window.
+func TestHeartbeatKeepsSessionAlive(t *testing.T) {
+	_, addr, ca, cleanup := relayHarness(t)
+	defer cleanup()
+	cliCert, _ := ca.IssueClientCert("mailnite-raw")
+	cliTLS, _ := pki.ClientTLSConfig(ca.CertPEM, cliCert.CertPEM, cliCert.KeyPEM, "127.0.0.1")
+	cli := valueclient.NewTLSClient(addr, cliTLS)
+	if err := cli.ConnectContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	args, _ := protocol.Encode(protocol.SessionRequest{
+		Version:      protocol.Version,
+		Binds:        []protocol.PortSpec{{Name: "svc", Port: 0, Proto: "tcp"}},
+		HeartbeatSec: 1, // window = 3s
+	})
+	put := make(chan value.Value)
+	events, _, err := cli.Chat(context.Background(), protocol.FnSession, args, 16, put)
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
+	if _, ok := <-events; !ok {
+		t.Fatal("no ready event")
+	}
+
+	// Beat every 500ms for 5s (past the 3s window) — the stream must stay open.
+	stop := time.After(5 * time.Second)
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			select {
+			case put <- value.Utf8(protocol.Heartbeat):
+			default:
+				t.Fatal("relay stopped draining beats")
+			}
+		case _, open := <-events:
+			if !open {
+				t.Fatal("beating session was reaped")
+			}
+		case <-stop:
+			close(put) // clean teardown
+			return
+		}
+	}
+}
