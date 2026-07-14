@@ -15,8 +15,9 @@
 # which a binary update would silently strip), and starts it. Re-running the
 # command upgrades in place and RESTARTS the service, so the fresh binary and
 # any new --token/--transport/--bind take effect immediately (settings not
-# repeated on the re-run are inherited from the existing install). A daily
-# systemd timer keeps it up to date.
+# repeated on the re-run are inherited from the existing install). An hourly
+# systemd timer keeps it up to date (each check is one tiny manifest GET; a
+# published release reaches every relay within about an hour).
 #
 # Options (after `bash -s --`):
 #   --token <KEY>      handshake key from the mailnite admin console (required
@@ -280,7 +281,7 @@ ARCH="$ARCH"
 BIN="$BIN"
 INSTALL_DIR="$INSTALL_DIR"
 
-manifest="\$(curl -fsSL $CURL_PROTO "\$BASE/v1/mailrelay.txt")" || exit 0 # manifest unreachable: try again tomorrow
+manifest="\$(curl -fsSL $CURL_PROTO "\$BASE/v1/mailrelay.txt")" || exit 0 # manifest unreachable: the next hourly run retries
 mf() { printf '%s\n' "\$manifest" | awk -v k="\$1" '\$1 == k { print \$2; exit }'; }
 
 version="\$(mf version)"
@@ -322,13 +323,18 @@ Type=oneshot
 ExecStart=$UPDATE_SH
 EOF
 
+  # Hourly, not daily: the check is a single small HTTPS GET (the download
+  # happens only when the channel actually moved), and an hourly cadence means
+  # a published release reaches every relay within ~70 minutes instead of a
+  # worst case of more than a day. The jitter spreads the fleet's checks so a
+  # release doesn't stampede the download host.
   cat > "$UPDATE_TIMER" <<'EOF'
 [Unit]
-Description=Daily mailnite relay self-update
+Description=Hourly mailnite relay self-update
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=4h
+OnCalendar=hourly
+RandomizedDelaySec=10m
 Persistent=true
 
 [Install]
@@ -376,6 +382,6 @@ echo
 echo "    status:   systemctl status mailrelay"
 echo "    logs:     journalctl -u mailrelay -f"
 if [ "$AUTOUPDATE" = 1 ]; then
-  echo "    updates:  daily via mailrelay-update.timer (this script --uninstall removes everything)"
+  echo "    updates:  hourly via mailrelay-update.timer (this script --uninstall removes everything)"
 fi
 echo
