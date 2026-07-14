@@ -192,25 +192,6 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 	}
 	s.outC <- ready // buffered; the first thing the client reads
 
-	// A session that promised heartbeats is reaped after ~3 silent intervals:
-	// its client is gone (slept laptop, hard crash) and its listeners must not
-	// squat the public ports until TCP keepalive notices minutes later. Armed
-	// BEFORE the session is published so a concurrent takeover shutdown always
-	// sees a settled field.
-	if req.HeartbeatSec > 0 {
-		hb := req.HeartbeatSec
-		if hb > 300 {
-			hb = 300
-		}
-		window := time.Duration(hb) * 3 * time.Second
-		s.hbTimer = time.AfterFunc(window, func() {
-			t.log.Warn("RelaySessionExpired",
-				zap.Int("heartbeatSec", hb), zap.Duration("silentFor", window))
-			s.shutdown()
-		})
-		s.hbWindow = window
-	}
-
 	// Reserve the accept loops' WaitGroup slots before the session is published,
 	// so a shutdown that races the loop startup still waits for every loop
 	// before closing outC.
@@ -230,12 +211,37 @@ func (t *Tunnel) session(ctx context.Context, args value.Value, inC <-chan value
 
 	// Two teardown triggers: the client cancels/streams-out (ctx) or half-closes
 	// its send side (inC drains to close). Either ends the session exactly once.
-	// Every inbound value counts as a heartbeat (protocol.Heartbeat by convention).
+	// A session that promised heartbeats (HeartbeatSec) adds a third: ~3 silent
+	// intervals mean its client is gone (slept laptop, hard crash), and its
+	// listeners must not squat the public ports until TCP keepalive notices
+	// minutes later. Every inbound value counts as a beat. The reap timer lives
+	// entirely INSIDE this goroutine — no shared timer state, nothing to race.
 	go func() {
-		for range inC {
-			if s.hbTimer != nil {
-				s.hbTimer.Reset(s.hbWindow)
+		if hb := req.HeartbeatSec; hb > 0 {
+			if hb > 300 {
+				hb = 300
 			}
+			window := time.Duration(hb) * 3 * time.Second
+			timer := time.NewTimer(window)
+			defer timer.Stop()
+			for {
+				select {
+				case _, ok := <-inC:
+					if !ok {
+						s.shutdown()
+						return
+					}
+					timer.Reset(window)
+				case <-timer.C:
+					t.log.Warn("RelaySessionExpired",
+						zap.Int("heartbeatSec", hb), zap.Duration("silentFor", window))
+					s.shutdown()
+					return
+				}
+			}
+		}
+		for range inC {
+			// control channel: values are beats only under a heartbeat promise.
 		}
 		s.shutdown()
 	}()
@@ -564,7 +570,9 @@ func (t *Tunnel) Close() {
 	}
 }
 
-// session is one client control connection's server-side state.
+// session is one client control connection's server-side state. (The heartbeat
+// reap timer is deliberately NOT here: it lives inside the control-channel
+// drain goroutine, single-owner, so no timer state is ever shared.)
 type session struct {
 	outC      chan value.Value
 	stop      chan struct{}
@@ -572,11 +580,6 @@ type session struct {
 	listeners []net.Listener
 	once      sync.Once
 	onClose   func() // called once on shutdown (deregisters the session)
-	// Heartbeat reaping (set before publication when the client declared
-	// HeartbeatSec): the timer fires shutdown after hbWindow of silence and is
-	// re-armed by every inbound value on the session chat.
-	hbTimer  *time.Timer
-	hbWindow time.Duration
 }
 
 // shutdown stops accepting, closes this session's listeners, waits for its accept
@@ -584,9 +587,6 @@ type session struct {
 // and deregisters the session.
 func (s *session) shutdown() {
 	s.once.Do(func() {
-		if s.hbTimer != nil {
-			s.hbTimer.Stop()
-		}
 		close(s.stop)
 		for _, ln := range s.listeners {
 			_ = ln.Close()
