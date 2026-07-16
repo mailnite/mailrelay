@@ -6,9 +6,9 @@ name: Release
 #     NOT start a second run) and continues.
 #   • `git push` a vX.Y.Z tag yourself — the tag input is empty, no tag is made.
 # Either way it builds the distributables and publishes them + SHA256SUMS to a
-# PUBLIC GitHub release in mailnite/mailrelay-distr (source stays private), then
+# PUBLIC GitHub release in mailnite/mailrelay-dist (source stays private), then
 # registers the version with get.mailnite.com via a repository_dispatch to
-# mailnite-get — both with the publisher App (install it on mailrelay-distr AND
+# mailnite-get — both with the publisher App (install it on mailrelay-dist AND
 # mailnite-get; it never needs write to this source repo).
 on:
   push:
@@ -23,7 +23,7 @@ on:
 permissions:
   contents: write      # create the source tag on a manual run (+ read for notes)
   pull-requests: read  # so generated notes can include merged-PR titles
-  # The public release is created in mailrelay-distr with the scoped App token
+  # The public release is created in mailrelay-dist with the scoped App token
   # below — never GITHUB_TOKEN, which can only touch this repo.
 
 env:
@@ -79,7 +79,7 @@ jobs:
         run: make release # VERSION comes from the env resolved above
 
       # Publisher App token — Contents: Write, scoped to the two PUBLIC repos it
-      # writes to: mailrelay-distr (the release) and mailnite-get (the channel
+      # writes to: mailrelay-dist (the release) and mailnite-get (the channel
       # repository_dispatch, which also just needs Contents: write). One token, no
       # dispatch PAT. Install the publisher App on both. It never touches source.
       - name: Mint a token to publish the release and notify the channel
@@ -89,11 +89,11 @@ jobs:
           app-id: ${{ secrets.PUBLISH_APP_ID }}
           private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
           owner: mailnite
-          repositories: mailrelay-distr,mailnite-get
+          repositories: mailrelay-dist,mailnite-get
 
       - name: Publish the binaries to the public download repo
         env:
-          GH_TOKEN: ${{ steps.publish-token.outputs.token }} # writes into mailrelay-distr
+          GH_TOKEN: ${{ steps.publish-token.outputs.token }} # writes into mailrelay-dist
           SOURCE_TOKEN: ${{ github.token }}                  # reads THIS repo for the notes
         run: |
           # Notes are generated from THIS (private source) repo's history — the
@@ -102,12 +102,12 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
             -f tag_name="$VERSION" -q .body 2>/dev/null || echo "mailrelay $VERSION")
           # The tag lives in the private source repo, not here, so gh creates it in
-          # mailrelay-distr (no --verify-tag). A re-run just refreshes the assets.
+          # mailrelay-dist (no --verify-tag). A re-run just refreshes the assets.
           gh release create "$VERSION" dist/* \
-            --repo mailnite/mailrelay-distr \
+            --repo mailnite/mailrelay-dist \
             --title "mailrelay $VERSION" \
             --notes "$notes" \
-          || gh release upload "$VERSION" dist/* --repo mailnite/mailrelay-distr --clobber
+          || gh release upload "$VERSION" dist/* --repo mailnite/mailrelay-dist --clobber
 
       - name: Register the version with the update channel
         env:
