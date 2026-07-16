@@ -1,33 +1,32 @@
 name: Release
 
-# Tagging vX.Y.Z builds the six distributables (linux/darwin/windows ×
-# amd64/arm64, tar.gz + windows zip) with the version stamped in, and attaches
-# them plus SHA256SUMS to the GitHub release for that tag.
+# Tagging vX.Y.Z (in this PRIVATE source repo) builds the distributables with the
+# version stamped in and publishes them + SHA256SUMS to a PUBLIC GitHub release in
+# mailnite/mailrelay-distr — so install.sh / get.mailnite.com can download them
+# while the source stays private.
 #
-# It then registers the version with the get.mailnite.com update channel so
-# installers and daily update timers pick it up — automatically when a
-# CHANNEL_DISPATCH_TOKEN secret is present (a PAT with actions:write on
-# mailnite/mailnite-get), else do it by hand from the mailnite-get repo:
-#   Actions → "Register a release" → mailrelay / vX.Y.Z
+# It then registers the version with the get.mailnite.com update channel via a
+# repository_dispatch to mailnite-get — using the SAME publisher App token, so
+# there's no separate dispatch PAT. Install the publisher App on both
+# mailrelay-distr AND mailnite-get for this to run end to end.
 on:
   push:
     tags: ['v*']
 
 permissions:
-  contents: write # create the release and upload assets
+  contents: read       # read THIS (source) repo: checkout + generate release notes
+  pull-requests: read  # so generated notes can include merged-PR titles
+  # The public release itself is created in mailrelay-distr with the scoped App
+  # token below — the workflow's GITHUB_TOKEN can only touch this repo.
 
 env:
-  # Private modules (mailcore, mailrelay) + the go.arpabet.com vanity host are
-  # fetched directly over git, bypassing the public proxy. See build.yaml.
-  GOPRIVATE: go.arpabet.com/*,github.com/mailnite/*
+  # go.arpabet.com is a vanity host — fetch it directly over git (public repos
+  # under github.com/arpabet, no auth). mailrelay has no private dependencies.
+  GOPRIVATE: go.arpabet.com/*
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      # Exposed at job scope so a step `if` can test its presence (the secrets
-      # context is not reliably readable in `if`). Empty when the secret is unset.
-      CHANNEL_DISPATCH_TOKEN: ${{ secrets.CHANNEL_DISPATCH_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -46,24 +45,43 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
 
-      - name: Create the GitHub release with dist/*
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Re-running the workflow for an existing release just refreshes the
-          # assets instead of failing.
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
-            --title "mailrelay $GITHUB_REF_NAME" \
-            --generate-notes \
-          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+      # The shared release-publisher GitHub App (Contents: Write), scoped here to
+      # ONLY the public mailrelay-distr repo (the release) AND mailnite-get (the
+      # update-channel repository_dispatch, which also just needs Contents:write)
+      # — one token, no dispatch PAT. Install the App on BOTH those repos, and add
+      # its PUBLISH_APP_ID / PUBLISH_APP_PRIVATE_KEY secrets to this repo.
+      - name: Mint a token to publish the release and notify the channel
+        id: publish-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PUBLISH_APP_ID }}
+          private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
+          owner: mailnite
+          repositories: mailrelay-distr,mailnite-get
 
-      - name: Register the version with the update channel
-        # Optional zero-touch hop: fires only when the cross-repo PAT exists.
-        # Without it, register manually from the mailnite-get Actions tab.
-        if: ${{ env.CHANNEL_DISPATCH_TOKEN != '' }}
+      - name: Publish the binaries to the public download repo
         env:
-          GH_TOKEN: ${{ env.CHANNEL_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.publish-token.outputs.token }} # writes into mailrelay-distr
+          SOURCE_TOKEN: ${{ github.token }}                  # reads THIS repo for the notes
+        run: |
+          # Release notes are generated from THIS (private source) repo's history —
+          # mailrelay-distr has no meaningful commits to derive them from.
+          notes=$(GH_TOKEN="$SOURCE_TOKEN" gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" -q .body 2>/dev/null || echo "mailrelay $GITHUB_REF_NAME")
+          # The tag lives in the private source repo, not here, so gh creates it in
+          # mailrelay-distr (no --verify-tag). A re-run just refreshes the assets.
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo mailnite/mailrelay-distr \
+            --title "mailrelay $GITHUB_REF_NAME" \
+            --notes "$notes" \
+          || gh release upload "$GITHUB_REF_NAME" dist/* --repo mailnite/mailrelay-distr --clobber
+
+      # Zero-touch: fire the mailnite-get repository_dispatch with the SAME App
+      # token minted above (scoped to mailnite-get, Contents:write) — no PAT.
+      - name: Register the version with the update channel
+        env:
+          GH_TOKEN: ${{ steps.publish-token.outputs.token }}
         run: |
           gh api repos/mailnite/mailnite-get/dispatches \
             -f event_type=register-release \
