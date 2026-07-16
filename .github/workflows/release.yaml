@@ -16,6 +16,11 @@ on:
 permissions:
   contents: write # create the release and upload assets
 
+env:
+  # Private modules (mailcore, mailrelay) + the go.arpabet.com vanity host are
+  # fetched directly over git, bypassing the public proxy. See build.yaml.
+  GOPRIVATE: go.arpabet.com/*,github.com/mailnite/*
+
 jobs:
   release:
     runs-on: ubuntu-latest
