@@ -1,23 +1,30 @@
 name: Release
 
-# Tagging vX.Y.Z (in this PRIVATE source repo) builds the distributables with the
-# version stamped in and publishes them + SHA256SUMS to a PUBLIC GitHub release in
-# mailnite/mailrelay-distr — so install.sh / get.mailnite.com can download them
-# while the source stays private.
-#
-# It then registers the version with the get.mailnite.com update channel via a
-# repository_dispatch to mailnite-get — using the SAME publisher App token, so
-# there's no separate dispatch PAT. Install the publisher App on both
-# mailrelay-distr AND mailnite-get for this to run end to end.
+# Cut a release two ways, both ending up here:
+#   • Actions → Release → "Run workflow" → enter a version — this job CREATES the
+#     vX.Y.Z tag with the repo's own GITHUB_TOKEN (that push intentionally does
+#     NOT start a second run) and continues.
+#   • `git push` a vX.Y.Z tag yourself — the tag input is empty, no tag is made.
+# Either way it builds the distributables and publishes them + SHA256SUMS to a
+# PUBLIC GitHub release in mailnite/mailrelay-distr (source stays private), then
+# registers the version with get.mailnite.com via a repository_dispatch to
+# mailnite-get — both with the publisher App (install it on mailrelay-distr AND
+# mailnite-get; it never needs write to this source repo).
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to release — must be v1.2.3 form (leading v required). Creates the tag.'
+        required: true
+        type: string
 
 permissions:
-  contents: read       # read THIS (source) repo: checkout + generate release notes
+  contents: write      # create the source tag on a manual run (+ read for notes)
   pull-requests: read  # so generated notes can include merged-PR titles
-  # The public release itself is created in mailrelay-distr with the scoped App
-  # token below — the workflow's GITHUB_TOKEN can only touch this repo.
+  # The public release is created in mailrelay-distr with the scoped App token
+  # below — never GITHUB_TOKEN, which can only touch this repo.
 
 env:
   # go.arpabet.com is a vanity host — fetch it directly over git (public repos
@@ -31,6 +38,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # Resolve the version. A manual run supplies it and we CREATE the tag here
+      # with this repo's OWN GITHUB_TOKEN — no cross-repo App, and a GITHUB_TOKEN
+      # push never starts a second Release run. A tag push leaves inputs.tag empty
+      # and we just take the tag that triggered us.
+      - name: Resolve version and create the tag
+        id: ver
+        env:
+          INPUT: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$INPUT" ]; then
+            tag="$INPUT"
+            # The version MUST be a vMAJOR.MINOR.PATCH tag — the leading v is required.
+            printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              || { echo "::error::'$INPUT' is not a valid version — use the form v1.2.3"; exit 1; }
+            git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 \
+              && { echo "::error::tag $tag already exists — bump the version"; exit 1; }
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Release $tag"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$tag"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          echo "VERSION=$tag" >> "$GITHUB_ENV"
+          echo "Releasing $tag"
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -41,15 +76,12 @@ jobs:
         run: make test
 
       - name: Build the distributables
-        run: make release
-        env:
-          VERSION: ${{ github.ref_name }}
+        run: make release # VERSION comes from the env resolved above
 
-      # The shared release-publisher GitHub App (Contents: Write), scoped here to
-      # ONLY the public mailrelay-distr repo (the release) AND mailnite-get (the
-      # update-channel repository_dispatch, which also just needs Contents:write)
-      # — one token, no dispatch PAT. Install the App on BOTH those repos, and add
-      # its PUBLISH_APP_ID / PUBLISH_APP_PRIVATE_KEY secrets to this repo.
+      # Publisher App token — Contents: Write, scoped to the two PUBLIC repos it
+      # writes to: mailrelay-distr (the release) and mailnite-get (the channel
+      # repository_dispatch, which also just needs Contents: write). One token, no
+      # dispatch PAT. Install the publisher App on both. It never touches source.
       - name: Mint a token to publish the release and notify the channel
         id: publish-token
         uses: actions/create-github-app-token@v2
@@ -64,21 +96,19 @@ jobs:
           GH_TOKEN: ${{ steps.publish-token.outputs.token }} # writes into mailrelay-distr
           SOURCE_TOKEN: ${{ github.token }}                  # reads THIS repo for the notes
         run: |
-          # Release notes are generated from THIS (private source) repo's history —
-          # mailrelay-distr has no meaningful commits to derive them from.
+          # Notes are generated from THIS (private source) repo's history — the
+          # public download repo has no meaningful commits to derive them from.
           notes=$(GH_TOKEN="$SOURCE_TOKEN" gh api \
             "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" -q .body 2>/dev/null || echo "mailrelay $GITHUB_REF_NAME")
+            -f tag_name="$VERSION" -q .body 2>/dev/null || echo "mailrelay $VERSION")
           # The tag lives in the private source repo, not here, so gh creates it in
           # mailrelay-distr (no --verify-tag). A re-run just refreshes the assets.
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$VERSION" dist/* \
             --repo mailnite/mailrelay-distr \
-            --title "mailrelay $GITHUB_REF_NAME" \
+            --title "mailrelay $VERSION" \
             --notes "$notes" \
-          || gh release upload "$GITHUB_REF_NAME" dist/* --repo mailnite/mailrelay-distr --clobber
+          || gh release upload "$VERSION" dist/* --repo mailnite/mailrelay-distr --clobber
 
-      # Zero-touch: fire the mailnite-get repository_dispatch with the SAME App
-      # token minted above (scoped to mailnite-get, Contents:write) — no PAT.
       - name: Register the version with the update channel
         env:
           GH_TOKEN: ${{ steps.publish-token.outputs.token }}
@@ -86,5 +116,15 @@ jobs:
           gh api repos/mailnite/mailnite-get/dispatches \
             -f event_type=register-release \
             -f 'client_payload[project]=mailrelay' \
-            -f "client_payload[version]=$GITHUB_REF_NAME"
-          echo "Notified mailnite-get to register mailrelay $GITHUB_REF_NAME"
+            -f "client_payload[version]=$VERSION"
+          echo "Notified mailnite-get to register mailrelay $VERSION"
+
+      # If a MANUAL run created the tag but a later step failed, delete it so the
+      # version can be retried (a tag we were merely triggered by is left alone).
+      - name: Roll back the tag on failure
+        if: ${{ failure() && steps.ver.outputs.created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" --delete "refs/tags/$VERSION" || true
+          echo "Rolled back $VERSION after a failed release"
