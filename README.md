@@ -5,8 +5,8 @@ a laptop, any machine with no public IP) serve real mail and web on the public
 internet — using only a cheap VDS that has a public IP and nothing else.
 
 The relay **stores no mail and holds no user data.** It binds the public ports
-(25, 465, 587, 993, 995, 80, 443) on the VDS and forwards their raw bytes to your
-mailnite instance over a single, mutually-authenticated
+(25, 465, 587, 143, 993, 995, 80, 443) on the VDS and forwards their raw bytes to
+your mailnite instance over a single, mutually-authenticated
 [value-rpc](https://go.arpabet.com/value-rpc) connection **that mailnite dials
 outbound** — so your NAT/firewall never needs an inbound hole.
 
