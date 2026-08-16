@@ -70,3 +70,47 @@ func TestReverseListenerShedsWhenFull(t *testing.T) {
 		t.Fatalf("Accept after Close: %v", err)
 	}
 }
+
+/*
+TestConnFailStreak pins the redial trigger's whole contract: scattered
+failures interleaved with successes never trip (normal noise — an expired
+claim from a vanished scanner); a consecutive run trips exactly once at the
+threshold (the stale-session burst); and nothing re-trips afterwards — the
+session is already closing, so stragglers from the same backlog must not
+stack redials.
+*/
+func TestConnFailStreak(t *testing.T) {
+	var s connFailStreak
+
+	// Interleaved noise: fail/fail/ok forever stays below the threshold.
+	for i := 0; i < 3*connFailRedialThreshold; i++ {
+		if s.fail() {
+			t.Fatal("streak tripped despite successes in between")
+		}
+		if i%2 == 1 {
+			s.ok()
+		}
+	}
+	s.ok()
+
+	// A consecutive run: silent until the threshold, trips exactly there.
+	for i := 1; i < connFailRedialThreshold; i++ {
+		if s.fail() {
+			t.Fatalf("tripped early at %d", i)
+		}
+	}
+	if !s.fail() {
+		t.Fatalf("must trip at %d consecutive failures", connFailRedialThreshold)
+	}
+
+	// One-shot: neither more failures nor a late ok re-arm it.
+	for i := 0; i < connFailRedialThreshold+1; i++ {
+		if s.fail() {
+			t.Fatal("re-tripped after the one-shot")
+		}
+	}
+	s.ok()
+	if s.fail() {
+		t.Fatal("ok after the trip must not re-arm the streak")
+	}
+}

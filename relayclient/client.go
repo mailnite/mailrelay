@@ -55,6 +55,65 @@ type Session struct {
 	pumpDone  chan struct{}      // closed when the relay ends the event stream (teardown ack)
 	closed    bool
 	listeners map[string]*reverseListener
+
+	connFails connFailStreak // consecutive conn-open failures → forced redial
+}
+
+/*
+connFailStreak counts CONSECUTIVE failures to open announced connections, and
+trips once at the threshold.
+
+The signature it exists for: the session goes half-dead (NAT timeout, uplink
+blip), the relay keeps announcing accepts into the stalled stream, and when
+delivery resumes the whole backlog is past the relay's claim window — a burst
+of "unknown, expired, or unauthorized conn" with consecutive ids. Every one of
+those is a public connection LOST, and the same sick session also carries the
+DialOut egress (outbound mail via the relay, the reader's remote-image plane),
+so waiting for the heartbeat machinery to notice stretches a user-visible
+outage. Tripping closes the session, which is exactly the manual "Reconnect
+relay" action: the supervisor sees the listeners drop and dials a fresh
+session immediately.
+
+Consecutive-with-reset keeps ordinary noise out: an occasional expired claim
+(a scanner that vanished, one slow round trip) is followed by successful opens,
+which reset the streak. Only a run of failures with no success in between —
+the stale-session signature — reaches the threshold. One-shot per session:
+after the trip the session is closing; later stragglers must not re-trip.
+*/
+type connFailStreak struct {
+	mu      sync.Mutex
+	n       int
+	tripped bool
+}
+
+// connFailRedialThreshold is how many consecutive conn-open failures prove the
+// session is stale. Browsers open up to 6 parallel connections, so a flushed
+// backlog from one page load crosses this immediately; scattered singles never do.
+const connFailRedialThreshold = 5
+
+// fail records one failure and reports true exactly once: when the streak
+// reaches the threshold.
+func (t *connFailStreak) fail() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.tripped {
+		return false
+	}
+	t.n++
+	if t.n >= connFailRedialThreshold {
+		t.tripped = true
+		return true
+	}
+	return false
+}
+
+// ok resets the streak — a successful open proves the session is alive.
+func (t *connFailStreak) ok() {
+	t.mu.Lock()
+	if !t.tripped {
+		t.n = 0
+	}
+	t.mu.Unlock()
 }
 
 // Dial builds the value-rpc client for the configured transport and connects.
@@ -286,8 +345,18 @@ func (s *Session) pump(ctx context.Context, events <-chan value.Value) {
 				conn, err := s.openConn(ctx, e.ConnID, e.Secret, e.RemoteAddr)
 				if err != nil {
 					s.log.Warn("RelayConnOpenFailed", zap.Int64("connId", e.ConnID), zap.Error(err))
+					// A RUN of these is the stale-session signature (see
+					// connFailStreak): stop losing connections and redial now
+					// instead of waiting out the heartbeat cycle.
+					if s.connFails.fail() {
+						s.log.Warn("RelayConnOpenStreakForcingRedial",
+							zap.Int("consecutiveFailures", connFailRedialThreshold),
+							zap.String("relay", s.cfg.Addr))
+						go func() { _ = s.Close() }()
+					}
 					return
 				}
+				s.connFails.ok()
 				if !l.deliver(conn) {
 					s.log.Warn("RelayAcceptQueueFull",
 						zap.String("listener", e.Name), zap.String("remote", e.RemoteAddr))
