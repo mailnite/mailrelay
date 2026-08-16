@@ -3,12 +3,12 @@ module github.com/mailnite/mailrelay
 go 1.25.0
 
 require (
-	go.arpabet.com/cligo v0.5.1
-	go.arpabet.com/glue v1.5.1
-	go.arpabet.com/servion v1.5.5
-	go.arpabet.com/value v1.3.1
-	go.arpabet.com/value-rpc v1.5.5
-	go.arpabet.com/value-rpc/quic v1.5.5
+	go.arpabet.com/cligo v0.6.0
+	go.arpabet.com/glue v1.6.0
+	go.arpabet.com/servion v1.6.0
+	go.arpabet.com/value v1.4.0
+	go.arpabet.com/value-rpc v1.6.0
+	go.arpabet.com/value-rpc/quic v1.6.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.53.0
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da
