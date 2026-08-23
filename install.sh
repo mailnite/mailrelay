@@ -21,7 +21,13 @@
 #
 # Options (after `bash -s --`):
 #   --token <KEY>      handshake key from the mailnite admin console (required
-#                      on first install; MAILRELAY_TOKEN env works too)
+#                      on first install unless the mTLS bundle is given;
+#                      MAILRELAY_TOKEN env works too)
+#   --ca <path>        mutual TLS: tunnel CA certificate PEM (with --cert and
+#                      --key replaces the token; the mailnite console's
+#                      automatic setup passes these)
+#   --cert <path>      mutual TLS: relay server certificate PEM
+#   --key <path>       mutual TLS: relay server private key PEM
 #   --transport <t>    tcp | ws | quic          (default: tcp; all run under TLS)
 #   --bind <addr>      relay control bind       (default: 0.0.0.0:8443)
 #   --version <vX.Y.Z> install a specific version (default: stable channel)
@@ -37,6 +43,9 @@ BASE="https://get.mailnite.com"
 TOKEN="${MAILRELAY_TOKEN:-}"
 TRANSPORT="${MAILRELAY_TRANSPORT:-}"
 BIND="${MAILRELAY_BIND:-}"
+CA_SRC=""
+CERT_SRC=""
+KEY_SRC=""
 WANT_VERSION=""
 AUTOUPDATE=1
 MODE="install"
@@ -63,6 +72,9 @@ while [ $# -gt 0 ]; do
     --token)         TOKEN="${2:?--token needs a value}"; shift 2 ;;
     --transport)     TRANSPORT="${2:?--transport needs a value}"; shift 2 ;;
     --bind)          BIND="${2:?--bind needs a value}"; shift 2 ;;
+    --ca)            CA_SRC="${2:?--ca needs a path}"; shift 2 ;;
+    --cert)          CERT_SRC="${2:?--cert needs a path}"; shift 2 ;;
+    --key)           KEY_SRC="${2:?--key needs a path}"; shift 2 ;;
     --version)       WANT_VERSION="${2:?--version needs a value}"; shift 2 ;;
     --base)          BASE="${2:?--base needs a value}"; shift 2 ;;
     --no-autoupdate) AUTOUPDATE=0; shift ;;
@@ -206,23 +218,55 @@ fi
 # file — a reinstall must never silently drop the transport/bind (or the key)
 # the relay was running with.
 mkdir -p "$ENV_DIR"
+# The mutual-TLS bundle: PEMs land under the env dir with service-user-only
+# read access; the env file then points the relay at them. With a bundle the
+# token is optional — mTLS IS the authentication.
+PKI_DIR="$ENV_DIR/pki"
+CA_PEM="$PKI_DIR/ca.crt"
+CERT_PEM="$PKI_DIR/relay.crt"
+KEY_PEM="$PKI_DIR/relay.key"
+HAVE_MTLS=0
+if [ -n "$CA_SRC" ] || [ -n "$CERT_SRC" ] || [ -n "$KEY_SRC" ]; then
+  [ -n "$CA_SRC" ] && [ -n "$CERT_SRC" ] && [ -n "$KEY_SRC" ] \
+    || die "mutual TLS needs all three of --ca, --cert and --key"
+  [ -r "$CA_SRC" ] && [ -r "$CERT_SRC" ] && [ -r "$KEY_SRC" ] \
+    || die "cannot read the --ca/--cert/--key files"
+  mkdir -p "$PKI_DIR"
+  install -m 0644 "$CA_SRC" "$CA_PEM"
+  install -m 0644 "$CERT_SRC" "$CERT_PEM"
+  install -m 0640 "$KEY_SRC" "$KEY_PEM"
+  HAVE_MTLS=1
+fi
+
 if [ -s "$ENV_FILE" ]; then
   [ -n "$TOKEN" ]     || TOKEN="$(sed -n 's/^MAILRELAY_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
   [ -n "$TRANSPORT" ] || TRANSPORT="$(sed -n 's/^MAILRELAY_TRANSPORT=//p' "$ENV_FILE" | tail -n 1)"
   [ -n "$BIND" ]      || BIND="$(sed -n 's/^MAILRELAY_BIND=//p' "$ENV_FILE" | tail -n 1)"
+  # An existing mTLS install keeps its bundle across re-runs and updates —
+  # regenerating the env file must never silently drop the CA lines (that
+  # would flip a hardened relay back to token auth on the next timer tick).
+  if [ "$HAVE_MTLS" = 0 ] && grep -q '^MAILRELAY_CA=' "$ENV_FILE"; then
+    HAVE_MTLS=1
+  fi
 fi
-if [ -n "$TOKEN" ]; then
+if [ -n "$TOKEN" ] || [ "$HAVE_MTLS" = 1 ]; then
   umask 077
   {
-    echo "MAILRELAY_TOKEN=$TOKEN"
+    if [ -n "$TOKEN" ]; then echo "MAILRELAY_TOKEN=$TOKEN"; fi
     if [ -n "$TRANSPORT" ]; then echo "MAILRELAY_TRANSPORT=$TRANSPORT"; fi
     if [ -n "$BIND" ]; then echo "MAILRELAY_BIND=$BIND"; fi
+    if [ "$HAVE_MTLS" = 1 ]; then
+      echo "MAILRELAY_CA=$CA_PEM"
+      echo "MAILRELAY_CERT=$CERT_PEM"
+      echo "MAILRELAY_KEY=$KEY_PEM"
+    fi
   } > "$ENV_FILE"
   chown root:"$SVC_USER" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
+  [ -d "$PKI_DIR" ] && chown -R root:"$SVC_USER" "$PKI_DIR" || true
   umask 022
 else
-  die "no --token given and no existing $ENV_FILE — generate the key in the mailnite admin console (Mail relay → step 1) and re-run with --token"
+  die "no --token and no mTLS bundle (and no existing $ENV_FILE) — generate the key in the mailnite admin console (Mail relay → step 1), or let the console's automatic setup provision mutual TLS"
 fi
 
 # CAP_NET_BIND_SERVICE comes from the unit, not setcap: a file capability would

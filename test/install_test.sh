@@ -155,6 +155,40 @@ check "install #3 exits 0" test $? -eq 0
 check "rerun with --no-autoupdate disables the timer" \
   grep -q "systemctl disable --now mailrelay-update.timer" "$SYSCTL_LOG"
 
+# ===== 6. mutual TLS: bundle install without a token ==========================
+# The console's automatic setup path: three PEMs in, no token — the env file
+# points the relay at the staged bundle, and a later re-run/update must keep
+# the CA lines (dropping them would flip a hardened relay back to token auth).
+STAGE2="$WORK/stage2"
+mkdir -p "$STAGE2" "$WORK/pki"
+printf -- '-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n' > "$WORK/pki/ca.crt"
+printf -- '-----BEGIN CERTIFICATE-----\nSRV\n-----END CERTIFICATE-----\n' > "$WORK/pki/relay.crt"
+printf -- '-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n' > "$WORK/pki/relay.key"
+ENVF2="$STAGE2/etc/mailrelay/env"
+MAILRELAY_DESTDIR="$STAGE2" bash "$REPO/install.sh" \
+  --ca "$WORK/pki/ca.crt" --cert "$WORK/pki/relay.crt" --key "$WORK/pki/relay.key" \
+  --base http://test.local > "$WORK/install4.log" 2>&1
+check "mTLS install exits 0 without a token" test $? -eq 0
+check "env has no token line"      bash -c '! grep -q "^MAILRELAY_TOKEN=" "'"$ENVF2"'"'
+check "env points at the CA"       grep -qx "MAILRELAY_CA=$STAGE2/etc/mailrelay/pki/ca.crt" "$ENVF2"
+check "env points at the cert"     grep -qx "MAILRELAY_CERT=$STAGE2/etc/mailrelay/pki/relay.crt" "$ENVF2"
+check "env points at the key"      grep -qx "MAILRELAY_KEY=$STAGE2/etc/mailrelay/pki/relay.key" "$ENVF2"
+check "CA staged"                  grep -q "CA" "$STAGE2/etc/mailrelay/pki/ca.crt"
+check "server key staged"          grep -q "KEY" "$STAGE2/etc/mailrelay/pki/relay.key"
+
+# A re-run WITHOUT the flags keeps the bundle (the update timer's semantics).
+MAILRELAY_DESTDIR="$STAGE2" bash "$REPO/install.sh" \
+  --base http://test.local > "$WORK/install5.log" 2>&1
+check "mTLS re-run exits 0" test $? -eq 0
+check "re-run keeps the CA line"   grep -qx "MAILRELAY_CA=$STAGE2/etc/mailrelay/pki/ca.crt" "$ENVF2"
+check "re-run keeps the key line"  grep -qx "MAILRELAY_KEY=$STAGE2/etc/mailrelay/pki/relay.key" "$ENVF2"
+
+# An incomplete bundle refuses.
+MAILRELAY_DESTDIR="$STAGE2" bash "$REPO/install.sh" \
+  --ca "$WORK/pki/ca.crt" --base http://test.local > "$WORK/install6.log" 2>&1 \
+  && { echo "FAIL: partial bundle must refuse"; fail=1; } \
+  || echo "PASS: partial bundle refuses"
+
 echo
 if [ "$fail" = 0 ]; then
   echo "install.sh: ALL CHECKS PASSED"
