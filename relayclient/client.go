@@ -39,6 +39,10 @@ type Config struct {
 	ClientCertPEM []byte // mailnite's client cert (mTLS for tls/quic)
 	ClientKeyPEM  []byte // mailnite's client key
 	Token         string // handshake token (required for ws)
+
+	// Proxy, when enabled, carries the OUTER dial (proxy.go): the tunnel's
+	// TLS/mTLS still runs end-to-end through it.
+	Proxy ProxyConfig
 }
 
 // Session is a live tunnel: the value-rpc connection to the relay plus the
@@ -135,14 +139,23 @@ func Dial(ctx context.Context, cfg Config, log *zap.Logger) (*Session, error) {
 }
 
 func newClient(cfg Config) (valueclient.Client, error) {
+	if err := cfg.Proxy.Validate(); err != nil {
+		return nil, err
+	}
 	switch protocol.NormalizeTransport(cfg.Transport) {
 	case protocol.TransportTCP:
 		tlsCfg, err := clientTLS(cfg)
 		if err != nil {
 			return nil, err
 		}
+		if cfg.Proxy.Enabled() {
+			return valueclient.NewClientWithDialer(&proxiedTLSDialer{proxy: cfg.Proxy, addr: cfg.Addr, tlsCfg: tlsCfg}), nil
+		}
 		return valueclient.NewTLSClient(cfg.Addr, tlsCfg), nil
 	case protocol.TransportQUIC:
+		if cfg.Proxy.Enabled() {
+			return nil, xerrors.New("the QUIC transport is UDP — a SOCKS/CONNECT proxy cannot carry it; switch the relay transport to TCP or WebSocket, or turn the proxy off")
+		}
 		tlsCfg, err := clientTLS(cfg)
 		if err != nil {
 			return nil, err
@@ -151,6 +164,9 @@ func newClient(cfg Config) (valueclient.Client, error) {
 	case protocol.TransportWS:
 		if cfg.Token == "" {
 			return nil, xerrors.New("ws transport requires a token")
+		}
+		if cfg.Proxy.Enabled() {
+			return valueclient.NewClientWithDialer(&proxiedWSDialer{proxy: cfg.Proxy, url: "wss://" + cfg.Addr + cfg.Path}), nil
 		}
 		return valueclient.NewWebSocketClient("wss://" + cfg.Addr + cfg.Path), nil
 	default:
