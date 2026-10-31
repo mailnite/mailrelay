@@ -153,6 +153,31 @@ bind 25/443 without running as root; add `--sysctl` to flip
 relay with the `ca.crt` + `mailnite-client.crt` + `mailnite-client.key` bundle
 (this is what the onboarding wizard's "No public IP" path automates).
 
+## Running on a cloud machine
+
+mailnite's console can make the relay's machine itself at Google Cloud, AWS or
+Azure (the mailnite repo's `cloud.md`): a reserved address first, a Spot or
+Standard machine under it, this relay installed over SSH with the mutual-TLS
+material minted on the mailnite side, and the address moved onto every
+successor. Two things in this binary exist for that:
+
+- **The leaving notice.** `mailrelay serve` watches its cloud's metadata server
+  — Google `instance/preempted`, AWS `spot/instance-action` and the rebalance
+  recommendation, Azure Scheduled Events — and, when the machine is about to be
+  taken, broadcasts a `leaving` event (why, deadline) to every paired mailnite
+  over the control connection, so the console starts the successor while the
+  old machine still serves. The vendor is read from DMI; a machine that is not
+  a cloud VM polls nothing. `--cloud-notice=false` turns the watcher off.
+- **The firewall list.** The machine's firewall is owned by the console: the
+  relay's public ports (25, 465, 587, 143, 993, 995, 80, 443) and the control
+  port to anywhere, SSH just-in-time from the console's own address for the
+  minutes an operation needs (or always open, by policy), plus the rows the
+  admin adds. The relay itself binds only what mailnite's Ports page asks for,
+  as everywhere else.
+
+Nothing else changes: the relay stays a storage-free byte pump, started with the
+same `serve --ca --cert --key` as on a VDS you installed by hand.
+
 ## Commands
 
 ```
