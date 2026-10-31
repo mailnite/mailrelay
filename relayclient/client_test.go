@@ -6,12 +6,15 @@
 package relayclient
 
 import (
+	"context"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mailnite/mailrelay/protocol"
+	"go.arpabet.com/value"
+	"go.uber.org/zap"
 )
 
 // fakeConn is a net.Conn stub that records Close.
@@ -113,4 +116,48 @@ func TestConnFailStreak(t *testing.T) {
 	if s.fail() {
 		t.Fatal("ok after the trip must not re-arm the streak")
 	}
+}
+
+// TestPumpLeavingCallsOnLeaving: a leaving event on the session stream reaches
+// the hook with its why and deadline (the zero time when the relay named none);
+// without a hook the event is ignored, and the stream's other events still flow.
+func TestPumpLeavingCallsOnLeaving(t *testing.T) {
+	heard := make(chan [2]any, 2)
+	s := &Session{log: zap.NewNop(), listeners: map[string]*reverseListener{}, cfg: Config{Addr: "relay:8443",
+		OnLeaving: func(why string, deadline time.Time) { heard <- [2]any{why, deadline} }}}
+	events := make(chan value.Value, 4)
+	ev := func(e protocol.Event) value.Value {
+		v, err := protocol.Encode(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	events <- ev(protocol.Event{Type: protocol.EventError, Message: "noise"})
+	events <- ev(protocol.Event{Type: protocol.EventLeaving, Why: "terminate", Deadline: 1760000000})
+	events <- ev(protocol.Event{Type: protocol.EventLeaving, Why: "preempted"})
+	close(events)
+	s.pump(context.Background(), events)
+	// the hook runs off the pump's goroutine, so the two words may arrive in either order
+	got := map[string]time.Time{}
+	for i := 0; i < 2; i++ {
+		select {
+		case w := <-heard:
+			got[w[0].(string)] = w[1].(time.Time)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("heard %d of 2", i)
+		}
+	}
+	if d, ok := got["terminate"]; !ok || !d.Equal(time.Unix(1760000000, 0)) {
+		t.Fatalf("terminate with its deadline: %v", got)
+	}
+	if d, ok := got["preempted"]; !ok || !d.IsZero() {
+		t.Fatalf("preempted without a deadline: %v", got)
+	}
+	// no hook: the event is ignored, the pump ends with the stream
+	quiet := &Session{log: zap.NewNop(), listeners: map[string]*reverseListener{}}
+	events = make(chan value.Value, 1)
+	events <- ev(protocol.Event{Type: protocol.EventLeaving, Why: "preempted"})
+	close(events)
+	quiet.pump(context.Background(), events)
 }

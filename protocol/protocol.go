@@ -192,6 +192,11 @@ const (
 	EventReady  = "ready"  // first message: the outcome of every requested bind
 	EventAccept = "accept" // a public client connected to a bound port
 	EventError  = "error"  // a non-fatal problem the operator should see
+	// EventLeaving: the relay's machine is about to be taken by its cloud (a Spot
+	// eviction, a scheduled event) — the cloud watcher's word (cloud/notice.go),
+	// broadcast to every session so mailnite can bring a successor up while this
+	// machine still serves. A client that predates it ignores the unknown type.
+	EventLeaving = "leaving"
 )
 
 // BindResult reports the outcome of one PortSpec.
@@ -217,6 +222,8 @@ type Event struct {
 	Port       int          `value:"port,omitempty"`       // accept
 	RemoteAddr string       `value:"remoteAddr,omitempty"` // accept: the public client
 	Message    string       `value:"message,omitempty"`    // error
+	Why        string       `value:"why,omitempty"`        // leaving: preempted | terminate | stop | rebalance | preempt | …
+	Deadline   int64        `value:"deadline,omitempty"`   // leaving: unix seconds the cloud named (0 = not said)
 }
 
 // ConnArgs is the argument of the conn chat: which accepted connection this chat

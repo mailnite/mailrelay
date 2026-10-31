@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/mailnite/mailrelay/cloud"
+	"github.com/mailnite/mailrelay/protocol"
 	"github.com/mailnite/mailrelay/relay"
 	"go.arpabet.com/cligo"
 	"go.uber.org/zap"
@@ -39,6 +41,9 @@ type ServeCommand struct {
 	Key       string `cli:"option=key,default=,env=MAILRELAY_KEY,help=relay server private key PEM"`
 	Token     string `cli:"option=token,default=,env=MAILRELAY_TOKEN,help=handshake token (required for ws)"`
 	TokenFile string `cli:"option=token-file,default=,env=MAILRELAY_TOKEN_FILE,help=file containing the handshake token"`
+	// CloudNotice: whether to watch the cloud's metadata for the machine being taken (Spot eviction, scheduled
+	// event) and tell every paired mailnite with a `leaving` event — on by default where the DMI vendor is a cloud.
+	CloudNotice bool `cli:"option=cloud-notice,default=true,env=MAILRELAY_CLOUD_NOTICE,help=watch the cloud metadata for an eviction notice and tell mailnite (Google Cloud, AWS, Azure)"`
 
 	server *relay.Server // the command-scoped bean, retained for Run
 }
@@ -110,6 +115,21 @@ func (t *ServeCommand) Run(ctx context.Context) error {
 	defer stop()
 
 	t.Log.Info("RelayStart", zap.String("transport", t.Transport), zap.String("bind", t.Bind))
+	// The cloud's word that this machine is going, broadcast to every session as
+	// a leaving event (cloud/notice.go): mailnite's watcher brings the successor
+	// up while this machine still serves. Nothing to watch off the three clouds.
+	if t.CloudNotice {
+		if vendor := cloud.Vendor(); vendor != "" {
+			t.Log.Info("RelayCloudNotice", zap.String("cloud", vendor))
+			go cloud.Watch(sctx, t.Log, vendor, func(n cloud.Notice) {
+				ev := protocol.Event{Type: protocol.EventLeaving, Why: n.Why}
+				if !n.Deadline.IsZero() {
+					ev.Deadline = n.Deadline.Unix()
+				}
+				t.server.Broadcast(ev)
+			})
+		}
+	}
 	return t.server.Serve(sctx)
 }
 

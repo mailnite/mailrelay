@@ -133,3 +133,20 @@ func TestDialPortAllowed(t *testing.T) {
 		}
 	}
 }
+
+// TestLeavingEventRoundTrip: the cloud watcher's word survives the wire with its
+// why and deadline, and its type is the one the client's pump switches on.
+func TestLeavingEventRoundTrip(t *testing.T) {
+	in := Event{Type: EventLeaving, Why: "preempted", Deadline: 1760000000}
+	v, err := Encode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Event
+	if err := Decode(v, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Type != "leaving" || out.Why != "preempted" || out.Deadline != 1760000000 {
+		t.Fatalf("round trip: %+v", out)
+	}
+}

@@ -876,3 +876,88 @@ func TestHeartbeatKeepsSessionAlive(t *testing.T) {
 		}
 	}
 }
+
+// TestBroadcastReachesSessions: the cloud watcher's leaving notice, broadcast
+// by the relay, fires every paired client's OnLeaving with its why and deadline
+// — two tenants, two callbacks — and the count says how many sessions took it.
+// A closed session is not counted.
+func TestBroadcastReachesSessions(t *testing.T) {
+	log := zap.NewNop()
+	ca, _ := pki.GenerateCA("test-ca")
+	srvCert, _ := ca.IssueServerCert([]string{"127.0.0.1"})
+	cliCert, _ := ca.IssueClientCert("mailnite")
+	srvTLS, _ := pki.ServerTLSConfig(srvCert.CertPEM, srvCert.KeyPEM, ca.CertPEM)
+	// The relay proper keeps a dropped connection's session for sessionRetention
+	// (server.go); a closed client is out of the broadcast once that passed.
+	srv, err := valueserver.NewTLSServer("127.0.0.1:0", srvTLS, log, valueserver.WithSessionRetention(200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := relay.New(log, "")
+	tun.Register(srv)
+	go srv.Run()
+	defer srv.Close()
+	defer tun.Close()
+
+	type word struct {
+		why      string
+		deadline time.Time
+	}
+	heard := make(chan word, 4)
+	dial := func() *relayclient.Session {
+		s, err := relayclient.Dial(context.Background(), relayclient.Config{
+			Transport: protocol.TransportTCP, Addr: srv.Addr().String(), ServerName: "127.0.0.1",
+			CAPEM: ca.CertPEM, ClientCertPEM: cliCert.CertPEM, ClientKeyPEM: cliCert.KeyPEM,
+			OnLeaving: func(why string, deadline time.Time) { heard <- word{why, deadline} },
+		}, log)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		if _, _, err := s.Bind(context.Background(), []protocol.PortSpec{{Name: "svc", Port: 0, Proto: "tcp"}}); err != nil {
+			t.Fatalf("bind: %v", err)
+		}
+		return s
+	}
+	a, b := dial(), dial()
+	defer a.Close()
+	defer b.Close()
+
+	if n := tun.Broadcast(protocol.Event{Type: protocol.EventLeaving, Why: "preempted", Deadline: 1760000000}); n != 2 {
+		t.Fatalf("two sessions took it, not %d", n)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case w := <-heard:
+			if w.why != "preempted" || w.deadline.Unix() != 1760000000 {
+				t.Fatalf("heard %+v", w)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("client %d never heard the leaving", i)
+		}
+	}
+	// a closed session is out of the count — once the relay has torn it down (the
+	// client's half-close travels the wire; probe until the relay saw it)
+	a.Close()
+	n := 2
+	for deadline := time.Now().Add(5 * time.Second); n != 1 && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+		n = tun.Broadcast(protocol.Event{Type: protocol.EventLeaving, Why: "probe"})
+	}
+	if n != 1 {
+		t.Fatalf("one session left, not %d", n)
+	}
+	// the probes reached b; the last word must be the terminate
+	if n := tun.Broadcast(protocol.Event{Type: protocol.EventLeaving, Why: "terminate"}); n != 1 {
+		t.Fatalf("one session left, not %d", n)
+	}
+	var last word
+	for deadline := time.Now().Add(3 * time.Second); last.why != "terminate" && time.Now().Before(deadline); {
+		select {
+		case last = <-heard:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if last.why != "terminate" || !last.deadline.IsZero() {
+		t.Fatalf("the remaining client's last word: %+v", last)
+	}
+}

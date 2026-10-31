@@ -545,6 +545,32 @@ func (t *Tunnel) sessionCount() int {
 	return len(t.sessions)
 }
 
+// Broadcast writes one event into every live session's stream — the cloud
+// watcher's `leaving` (cmd/serve.go), so each mailnite paired to this relay
+// learns the machine is going while it still serves. Reports how many sessions
+// took it; a session whose stream is full is skipped, not waited for.
+func (t *Tunnel) Broadcast(ev protocol.Event) int {
+	v, err := protocol.Encode(ev)
+	if err != nil {
+		t.log.Warn("RelayBroadcastEncode", zap.Error(err))
+		return 0
+	}
+	t.mu.Lock()
+	all := make([]*session, 0, len(t.sessions))
+	for s := range t.sessions {
+		all = append(all, s)
+	}
+	t.mu.Unlock()
+	n := 0
+	for _, s := range all {
+		if s.offer(v) {
+			n++
+		}
+	}
+	t.log.Info("RelayBroadcast", zap.String("type", ev.Type), zap.String("why", ev.Why), zap.Int("sessions", n), zap.Int("dropped", len(all)-n))
+	return n
+}
+
 // Close tears down every open session and refuses new ones (relay shutdown).
 func (t *Tunnel) Close() {
 	t.mu.Lock()
@@ -580,6 +606,10 @@ type session struct {
 	listeners []net.Listener
 	once      sync.Once
 	onClose   func() // called once on shutdown (deregisters the session)
+	// outMu guards the close of outC against a Broadcast in flight: the accept
+	// loops are fenced by wg, a broadcast comes from another goroutine entirely.
+	outMu     sync.Mutex
+	outClosed bool
 }
 
 // shutdown stops accepting, closes this session's listeners, waits for its accept
@@ -592,11 +622,31 @@ func (s *session) shutdown() {
 			_ = ln.Close()
 		}
 		s.wg.Wait()
+		s.outMu.Lock()
+		s.outClosed = true
 		close(s.outC)
+		s.outMu.Unlock()
 		if s.onClose != nil {
 			s.onClose()
 		}
 	})
+}
+
+// offer queues an event for the client without blocking: a session whose stream
+// is full (a stalled client) drops it — a broadcast is advisory, and a client
+// that cannot read is about to be reaped anyway. False when dropped or closed.
+func (s *session) offer(ev value.Value) bool {
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if s.outClosed {
+		return false
+	}
+	select {
+	case s.outC <- ev:
+		return true
+	default:
+		return false
+	}
 }
 
 func randomSecret() string {

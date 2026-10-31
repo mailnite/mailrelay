@@ -230,6 +230,18 @@ func (t *Server) Shutdown() {
 	}
 }
 
+// Broadcast hands an event to every live session (the cloud watcher's leaving
+// notice); 0 before Serve or after Shutdown.
+func (t *Server) Broadcast(ev protocol.Event) int {
+	t.mu.Lock()
+	tun, stopped := t.tun, t.stopped
+	t.mu.Unlock()
+	if tun == nil || stopped {
+		return 0
+	}
+	return tun.Broadcast(ev)
+}
+
 // Destroy implements glue.DisposableBean: closing the container that owns the
 // server is the guaranteed release of the VDS's public ports.
 func (t *Server) Destroy() error {

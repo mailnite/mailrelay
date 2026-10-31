@@ -43,6 +43,12 @@ type Config struct {
 	// Proxy, when enabled, carries the OUTER dial (proxy.go): the tunnel's
 	// TLS/mTLS still runs end-to-end through it.
 	Proxy ProxyConfig
+
+	// OnLeaving, when set, is called once per `leaving` event the relay streams:
+	// its machine is about to be taken by its cloud (why, and the deadline the
+	// cloud named — the zero time when it named none). mailnite's cloud watcher
+	// starts the successor at once; nil ignores the event.
+	OnLeaving func(why string, deadline time.Time)
 }
 
 // Session is a live tunnel: the value-rpc connection to the relay plus the
@@ -380,6 +386,15 @@ func (s *Session) pump(ctx context.Context, events <-chan value.Value) {
 			}(e)
 		case protocol.EventError:
 			s.log.Warn("RelayEvent", zap.String("message", e.Message))
+		case protocol.EventLeaving:
+			var deadline time.Time
+			if e.Deadline > 0 {
+				deadline = time.Unix(e.Deadline, 0)
+			}
+			s.log.Warn("RelayLeaving", zap.String("why", e.Why), zap.Time("deadline", deadline), zap.String("relay", s.cfg.Addr))
+			if s.cfg.OnLeaving != nil {
+				go s.cfg.OnLeaving(e.Why, deadline)
+			}
 		}
 	}
 }
